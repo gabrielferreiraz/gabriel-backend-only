@@ -140,12 +140,25 @@ app.post('/message/send-text/:userId', async (req, res) => {
   const session = activeClients.get(userId);
   if (!session || !session.ready) return res.status(400).send('Client não pronto.');
 
-  try {
-    await session.client.sendMessage(`${number}@c.us`, message);
-    res.send('Mensagem enviada!');
-  } catch (err) {
-    res.status(500).send('Erro ao enviar.');
-  }
+  function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+try {
+  const chatId = `${number}@c.us`;
+  const chat = await session.client.getChatById(chatId);
+
+  await chat.sendStateTyping(); // Simula digitação
+  await delay(2000); // Espera 2 segundos
+  await chat.clearState(); // Para de digitar
+
+  await session.client.sendMessage(chatId, message);
+
+  res.send('Mensagem enviada com simulação de digitação!');
+} catch (err) {
+  console.error(err);
+  res.status(500).send('Erro ao enviar.');
+}
 });
 
 app.get('/', (req, res) => {
