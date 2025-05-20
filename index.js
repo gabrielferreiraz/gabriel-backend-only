@@ -57,12 +57,16 @@ app.get('/instance/create/:userId', (req, res) => {
   });
 
   client.on('message', async (msg) => {
+    const contact = await msg.getContact();
+  
     const log = {
       number: msg.from,
+      name: contact.pushname || contact.name || contact.number,
       body: msg.body,
       type: msg.type,
       timestamp: new Date()
     };
+  
     sessionData.logs.push(log);
   
     if (sessionData.webhookUrl) {
