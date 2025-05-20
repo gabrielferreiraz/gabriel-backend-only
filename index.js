@@ -157,7 +157,7 @@ function delay(ms) {
 }
 
 function calcularTempoDigitacao(texto) {
-  const caracteresPorSegundo = 10; // Altere se quiser mais rápido ou mais lento
+  const caracteresPorSegundo = 6; // Altere se quiser mais rápido ou mais lento
   const tempo = Math.ceil(texto.length / caracteresPorSegundo) * 1000;
   return Math.min(tempo, 15000); // Limita a 15 segundos de digitação
 }
