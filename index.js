@@ -133,6 +133,18 @@ app.get('/webhook/get/:userId', (req, res) => {
   res.send(session.webhookUrl || 'Nenhum webhook configurado.');
 });
 
+app.get('/webhook/list', (req, res) => {
+  const result = [];
+
+  activeClients.forEach((session, userId) => {
+    if (session.webhookUrl) {
+      result.push({ userId, webhookUrl: session.webhookUrl });
+    }
+  });
+
+  res.send(result);
+});
+
 app.post('/message/send-text/:userId', async (req, res) => {
   const { userId } = req.params;
   const { number, message } = req.body;
