@@ -140,16 +140,24 @@ app.post('/message/send-text/:userId', async (req, res) => {
   const session = activeClients.get(userId);
   if (!session || !session.ready) return res.status(400).send('Client não pronto.');
 
-  function delay(ms) {
+function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function calcularTempoDigitacao(texto) {
+  const caracteresPorSegundo = 10; // Altere se quiser mais rápido ou mais lento
+  const tempo = Math.ceil(texto.length / caracteresPorSegundo) * 1000;
+  return Math.min(tempo, 15000); // Limita a 15 segundos de digitação
 }
 
 try {
   const chatId = `${number}@c.us`;
   const chat = await session.client.getChatById(chatId);
 
+  const tempoDigitacao = calcularTempoDigitacao(message);
+
   await chat.sendStateTyping(); // Simula digitação
-  await delay(2000); // Espera 2 segundos
+  await delay(tempoDigitacao); // Espera proporcional ao texto
   await chat.clearState(); // Para de digitar
 
   await session.client.sendMessage(chatId, message);
