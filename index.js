@@ -130,6 +130,22 @@ app.get('/instance/qr/:userId', (req, res) => {
   res.send(`<img src="${session.qrCode}" />`);
 });
 
+app.get('/instance/active', (req, res) => {
+  const users = [];
+
+  for (const [userId, session] of activeClients.entries()) {
+    users.push({
+      userId,
+      ready: session.ready,
+      webhookUrl: session.webhookUrl || null,
+      mensagensNaFila: messageQueues.get(userId)?.length || 0,
+      conectado: session.ready ? true : false
+    });
+  }
+
+  res.json(users);
+});
+
 app.post('/instance/disconnect/:userId', async (req, res) => {
   const { userId } = req.params;
   const session = activeClients.get(userId);
