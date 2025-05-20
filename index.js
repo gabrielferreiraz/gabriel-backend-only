@@ -49,11 +49,11 @@ app.get('/instance/create/:userId', (req, res) => {
 
   client.on('ready', () => {
     sessionData.ready = true;
-    console.log([${userId}] Pronto); 
+    console.log(`[${userId}] Pronto`); 
   });
 
   client.on('authenticated', () => {
-    console.log([${userId}] Autenticado);
+    console.log(`[${userId}] Autenticado`);
   });
 
   client.on('message', async (msg) => {
@@ -69,7 +69,7 @@ app.get('/instance/create/:userId', (req, res) => {
       try {
         await axios.post(sessionData.webhookUrl, { ...log, userId });
       } catch (err) {
-        console.error(Erro no webhook de ${userId}: ${err.message});
+        console.error(`Erro no webhook de ${userId}: ${err.message}`);
       }
     }
   });
@@ -78,7 +78,7 @@ app.get('/instance/create/:userId', (req, res) => {
   client.initialize();
   activeClients.set(userId, sessionData);
 
-  res.status(200).send(Instância '${userId}' criada com sucesso.);
+  res.status(200).send(`Instância '${userId}' criada com sucesso.`);
 });
 
 app.get('/messages/log/:userId', (req, res) => {
@@ -98,7 +98,7 @@ app.get('/instance/qr/:userId', (req, res) => {
   const { userId } = req.params;
   const session = activeClients.get(userId);
   if (!session || !session.qrCode) return res.status(404).send('QR Code não disponível.');
-  res.send(<img src="${session.qrCode}" />);
+  res.send(`<img src="${session.qrCode}" />`);
 });
 
 app.post('/instance/disconnect/:userId', async (req, res) => {
@@ -111,7 +111,7 @@ app.post('/instance/disconnect/:userId', async (req, res) => {
     await session.client.destroy();
     activeClients.delete(userId);
 
-    res.send(Sessão ${userId} desconectada.);
+    res.send(`Sessão ${userId} desconectada.`);
   } catch (err) {
     res.status(500).send('Erro ao desconectar.');
   }
@@ -123,7 +123,7 @@ app.post('/webhook/set/:userId', (req, res) => {
   const session = activeClients.get(userId);
   if (!session) return res.status(404).send('Sessão não encontrada.');
   session.webhookUrl = url;
-  res.send(Webhook para ${userId} setado para ${url});
+  res.send(`Webhook para ${userId} setado para ${url}`);
 });
 
 app.get('/webhook/get/:userId', (req, res) => {
@@ -163,7 +163,7 @@ function calcularTempoDigitacao(texto) {
 }
 
 try {
-  const chatId = ${number}@c.us;
+  const chatId = `${number}@c.us`;
   const chat = await session.client.getChatById(chatId);
 
   const tempoDigitacao = calcularTempoDigitacao(message);
@@ -187,4 +187,4 @@ app.get('/', (req, res) => {
 
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(Backend multi-sessão rodando na porta ${PORT}));
+app.listen(PORT, () => console.log(`Backend multi-sessão rodando na porta ${PORT}`));
