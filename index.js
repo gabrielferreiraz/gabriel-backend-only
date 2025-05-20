@@ -91,6 +91,31 @@ app.get('/messages/log/:userId', (req, res) => {
   res.send(session.logs);
 });
 
+app.get('/instance/chats/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const session = activeClients.get(userId);
+
+  if (!session || !session.ready) {
+    return res.status(400).send('Instância não pronta ou não existe.');
+  }
+
+  try {
+    const chats = await session.client.getChats();
+    const total = chats.length;
+
+    // Se quiser retornar apenas nomes:
+    const nomes = chats.map(chat => ({
+      id: chat.id._serialized,
+      name: chat.name || chat.formattedTitle || chat.id.user
+    }));
+
+    res.json({ total, chats: nomes });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Erro ao buscar chats.');
+  }
+});
+
 app.get('/instance/status/:userId', (req, res) => {
   const { userId } = req.params;
   const session = activeClients.get(userId);
@@ -161,7 +186,7 @@ function delay(ms) {
 }
 
 function calcularTempoDigitacao(texto) {
-  const caracteresPorSegundo = 6; // Altere se quiser mais rápido ou mais lento
+  const caracteresPorSegundo = 16; // Altere se quiser mais rápido ou mais lento
   const tempo = Math.ceil(texto.length / caracteresPorSegundo) * 1000;
   return Math.min(tempo, 15000); // Limita a 15 segundos de digitação
 }
