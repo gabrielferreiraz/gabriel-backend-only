@@ -287,9 +287,10 @@ app.post('/message/send-text/:userId', async (req, res) => {
   try {
     const result = await sendPromise;
     res.send(result);
-  } catch (err) {
-    res.status(500).send('Erro ao enviar mensagem.');
-  }
+ } catch (err) {
+  console.error('Erro no envio de mensagem:', err); // 👈 Log completo
+  res.status(500).send('Erro ao enviar mensagem.');
+}
 });
 
 app.post('/ia/pause/:userId', (req, res) => {
