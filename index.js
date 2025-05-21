@@ -10,6 +10,8 @@ app.use(express.json());
 
 const activeClients = new Map(); // userId → { client, qr, ready, webhookUrl }
 const pausedNumbers = new Map(); // userId => Set de números pausados
+const messageQueues = new Map(); // userId => array de mensagens { number, message }
+const isSendingMessage = new Map(); // userId => booleano de controle de envio
 
 
 app.get('/instance/create/:userId', (req, res) => {
@@ -196,40 +198,78 @@ app.get('/webhook/list', (req, res) => {
   res.send(result);
 });
 
+async function processQueue(userId) {
+  if (isSendingMessage.get(userId)) return; // já está processando
+
+  const session = activeClients.get(userId);
+  if (!session || !session.ready) return;
+
+  const queue = messageQueues.get(userId);
+  if (!queue || queue.length === 0) return;
+
+  isSendingMessage.set(userId, true);
+
+  while (queue.length > 0) {
+    const { number, message, resolve, reject } = queue.shift();
+
+    try {
+      const chatId = `${number}@c.us`;
+      const chat = await session.client.getChatById(chatId);
+
+      const tempoDigitacao = calcularTempoDigitacao(message);
+
+      await chat.sendStateTyping();
+      await delay(tempoDigitacao);
+      await chat.clearState();
+      await session.client.sendMessage(chatId, message);
+
+      resolve('Mensagem enviada!');
+    } catch (err) {
+      console.error(`[${userId}] Erro ao enviar mensagem para ${number}:`, err);
+      reject(err);
+    }
+  }
+
+  isSendingMessage.set(userId, false);
+}
+
+
 app.post('/message/send-text/:userId', async (req, res) => {
   const { userId } = req.params;
   const { number, message } = req.body;
 
   const session = activeClients.get(userId);
-  if (!session || !session.ready) return res.status(400).send('Client não pronto.');
+  if (!session || !session.ready) {
+    return res.status(400).send('Client não pronto.');
+  }
 
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+  if (!messageQueues.has(userId)) {
+    messageQueues.set(userId, []);
+  }
 
-function calcularTempoDigitacao(texto) {
-  const caracteresPorSegundo = 16; // Altere se quiser mais rápido ou mais lento
-  const tempo = Math.ceil(texto.length / caracteresPorSegundo) * 1000;
-  return Math.min(tempo, 15000); // Limita a 15 segundos de digitação
-}
+  function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
 
-try {
-  const chatId = `${number}@c.us`;
-  const chat = await session.client.getChatById(chatId);
+  function calcularTempoDigitacao(texto) {
+    const caracteresPorSegundo = 16;
+    const tempo = Math.ceil(texto.length / caracteresPorSegundo) * 1000;
+    return Math.min(tempo, 15000);
+  }
 
-  const tempoDigitacao = calcularTempoDigitacao(message);
+  // Retornamos a promessa de envio para dar resposta correta à API
+  const sendPromise = new Promise((resolve, reject) => {
+    messageQueues.get(userId).push({ number, message, resolve, reject });
+  });
 
-  await chat.sendStateTyping(); // Simula digitação
-  await delay(tempoDigitacao); // Espera proporcional ao texto
-  await chat.clearState(); // Para de digitar
+  processQueue(userId); // inicia o processamento da fila
 
-  await session.client.sendMessage(chatId, message);
-
-  res.send('Mensagem enviada com simulação de digitação!');
-} catch (err) {
-  console.error(err);
-  res.status(500).send('Erro ao enviar.');
-}
+  try {
+    const result = await sendPromise;
+    res.send(result);
+  } catch (err) {
+    res.status(500).send('Erro ao enviar mensagem.');
+  }
 });
 
 app.post('/ia/pause/:userId', (req, res) => {
