@@ -175,8 +175,28 @@ app.post('/webhook/set/:userId', (req, res) => {
   const { url } = req.body;
   const session = activeClients.get(userId);
   if (!session) return res.status(404).send('Sessão não encontrada.');
-  session.webhookUrl = url;
-  res.send(`Webhook para ${userId} setado para ${url}`);
+  (async () => {
+  try {
+    // Validação: envia um teste simples para o webhook
+    const testePayload = {
+      test: true,
+      userId,
+      message: "Teste de validação do webhook"
+    };
+
+    const response = await axios.post(url, testePayload, { timeout: 5000 });
+
+    if (response.status >= 200 && response.status < 300) {
+      session.webhookUrl = url;
+      res.send(`✅ Webhook válido e setado para ${url}`);
+    } else {
+      res.status(400).send(`⚠️ Webhook respondeu com status ${response.status}. Não foi salvo.`);
+    }
+  } catch (err) {
+    console.error(`Erro ao validar webhook de ${userId}:`, err.message);
+    res.status(400).send(`❌ Não foi possível validar o webhook. Erro: ${err.message}`);
+  }
+})();
 });
 
 app.get('/webhook/get/:userId', (req, res) => {
