@@ -234,6 +234,14 @@ async function processQueue(userId) {
 
     try {
       const chatId = `${number}@c.us`;
+      const isRegistered = await session.client.isRegisteredUser(chatId);
+      
+      if (!isRegistered) {
+        console.error(`[${userId}] Número inválido ou não registrado no WhatsApp: ${number}`);
+        reject(new Error(`Número ${number} não possui WhatsApp.`));
+        continue;
+      }
+      
       const chat = await session.client.getChatById(chatId);
 
       const tempoDigitacao = calcularTempoDigitacao(message);
@@ -246,7 +254,7 @@ async function processQueue(userId) {
       resolve('Mensagem enviada!');
     } catch (err) {
       console.error(`[${userId}] Erro ao enviar mensagem para ${number}:`, err);
-      reject(err);
+      reject(new Error(`Falha ao enviar mensagem para ${number}: ${err.message}`));
     }
   }
 
