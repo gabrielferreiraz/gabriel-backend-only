@@ -224,6 +224,10 @@ function calcularTempoDigitacao(texto) {
     return Math.min(tempo, 15000);
   }
 
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
 async function processQueue(userId) {
   if (isSendingMessage.get(userId)) return; // já está processando
 
@@ -280,11 +284,6 @@ app.post('/message/send-text/:userId', async (req, res) => {
   if (!messageQueues.has(userId)) {
     messageQueues.set(userId, []);
   }
-
-  function delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
 
   // Retornamos a promessa de envio para dar resposta correta à API
   const sendPromise = new Promise((resolve, reject) => {
