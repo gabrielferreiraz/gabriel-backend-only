@@ -9,6 +9,8 @@ app.use(cors());
 app.use(express.json());
 
 const activeClients = new Map(); // userId → { client, qr, ready, webhookUrl }
+const pausedNumbers = new Map(); // userId => Set de números pausados
+
 
 app.get('/instance/create/:userId', (req, res) => {
   const { userId } = req.params;
@@ -69,7 +71,11 @@ app.get('/instance/create/:userId', (req, res) => {
   
     sessionData.logs.push(log);
   
-    if (sessionData.webhookUrl) {
+   const isPaused = pausedNumbers.get(userId)?.has(msg.from);
+
+    if (isPaused) {
+      console.log(`[IA PAUSADA] Mensagem de ${msg.from} ignorada pela IA.`);
+    } else if (sessionData.webhookUrl) {
       try {
         await axios.post(sessionData.webhookUrl, { ...log, userId });
       } catch (err) {
@@ -224,6 +230,35 @@ try {
   console.error(err);
   res.status(500).send('Erro ao enviar.');
 }
+});
+
+app.post('/ia/pause/:userId', (req, res) => {
+  const { userId } = req.params;
+  const { number } = req.body;
+
+  if (!number) return res.status(400).send('Número é obrigatório.');
+
+  if (!pausedNumbers.has(userId)) {
+    pausedNumbers.set(userId, new Set());
+  }
+
+  pausedNumbers.get(userId).add(number);
+  res.send(`Atendimento da IA pausado para ${number} em ${userId}`);
+});
+
+// Retomar IA para um número específico
+app.post('/ia/resume/:userId', (req, res) => {
+  const { userId } = req.params;
+  const { number } = req.body;
+
+  if (!number) return res.status(400).send('Número é obrigatório.');
+
+  const userPaused = pausedNumbers.get(userId);
+  if (userPaused) {
+    userPaused.delete(number);
+  }
+
+  res.send(`Atendimento da IA retomado para ${number} em ${userId}`);
 });
 
 app.get('/', (req, res) => {
