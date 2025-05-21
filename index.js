@@ -218,6 +218,12 @@ app.get('/webhook/list', (req, res) => {
   res.send(result);
 });
 
+function calcularTempoDigitacao(texto) {
+    const caracteresPorSegundo = 16;
+    const tempo = Math.ceil(texto.length / caracteresPorSegundo) * 1000;
+    return Math.min(tempo, 15000);
+  }
+
 async function processQueue(userId) {
   if (isSendingMessage.get(userId)) return; // já está processando
 
@@ -279,11 +285,6 @@ app.post('/message/send-text/:userId', async (req, res) => {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  function calcularTempoDigitacao(texto) {
-    const caracteresPorSegundo = 16;
-    const tempo = Math.ceil(texto.length / caracteresPorSegundo) * 1000;
-    return Math.min(tempo, 15000);
-  }
 
   // Retornamos a promessa de envio para dar resposta correta à API
   const sendPromise = new Promise((resolve, reject) => {
