@@ -37,7 +37,7 @@ app.get('/instance/create/:userId', (req, res) => {
     ready: false,
     webhookUrl: null,
     userId, 
-    logs: [] 
+    logs: [],
     createdAt: new Date() // ✅ Aqui adiciona a data de criação
   };
   
