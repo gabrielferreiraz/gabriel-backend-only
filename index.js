@@ -54,6 +54,8 @@ app.get('/instance/create/:userId', (req, res) => {
 
   client.on('ready', () => {
     sessionData.ready = true;
+    sessionData.number = client.info.wid.user;  // ← Aqui pega o número da conta
+    console.log(`[${userId}] Pronto - Número conectado: ${sessionData.number}`);
     console.log(`[${userId}] Pronto`); 
   });
 
