@@ -38,6 +38,7 @@ app.get('/instance/create/:userId', (req, res) => {
     webhookUrl: null,
     userId, 
     logs: [] 
+    createdAt: new Date() // ✅ Aqui adiciona a data de criação
   };
   
 
@@ -152,6 +153,20 @@ app.get('/instance/active', (req, res) => {
   }
 
   res.json(users);
+});
+
+app.get('/instance/info/:userId', (req, res) => {
+  const { userId } = req.params;
+  const session = activeClients.get(userId);
+  if (!session) return res.status(404).send('Sessão não encontrada.');
+
+  res.json({
+    userId: session.userId,
+    ready: session.ready,
+    webhookUrl: session.webhookUrl,
+    createdAt: session.createdAt, // ✅ Aqui também
+    mensagensNaFila: messageQueues.get(userId)?.length || 0
+  });
 });
 
 app.post('/instance/disconnect/:userId', async (req, res) => {
