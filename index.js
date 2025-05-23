@@ -167,6 +167,7 @@ app.get('/instance/info/:userId', (req, res) => {
     ready: session.ready,
     webhookUrl: session.webhookUrl,
     createdAt: session.createdAt, // ✅ Aqui também
+    number: session.number || null,   // ✅ Aqui adiciona o número
     mensagensNaFila: messageQueues.get(userId)?.length || 0
   });
 });
