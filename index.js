@@ -39,6 +39,7 @@ app.get('/instance/create/:userId', (req, res) => {
     userId, 
     logs: [],
     createdAt: new Date() // ✅ Aqui adiciona a data de criação
+    sentMessages: 0
   };
   
 
@@ -290,6 +291,7 @@ async function processQueue(userId) {
       await delay(tempoDigitacao);
       await chat.clearState();
       await session.client.sendMessage(chatId, message);
+      session.sentMessages += 1;
 
       resolve('Mensagem enviada!');
     } catch (err) {
@@ -372,6 +374,14 @@ app.get('/message/media/:userId/:messageId', async (req, res) => {
     console.error(`[${userId}] Erro ao obter mídia:`, err);
     res.status(500).send(`Erro ao obter mídia: ${err.message}`);
   }
+});
+
+app.get('/messages/sent/:userId', (req, res) => {
+  const { userId } = req.params;
+  const session = activeClients.get(userId);
+  if (!session) return res.status(404).send('Sessão não encontrada.');
+
+  res.json({ userId, sentMessages: session.sentMessages });
 });
 
 
