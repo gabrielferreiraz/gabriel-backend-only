@@ -75,7 +75,7 @@ app.get('/instance/create/:userId', (req, res) => {
       timestamp: new Date()
     };
 
-    if (msg.hasMedia && msg.type === 'audio') {
+    if (msg.hasMedia && msg.type === 'ptt') {
     const media = await msg.downloadMedia();
     if (media) {
       log.media = {
@@ -84,6 +84,22 @@ app.get('/instance/create/:userId', (req, res) => {
         filename: `audio-${Date.now()}.ogg`
       };
     }
+
+
+    await axios.post(WEBHOOK_URL, {
+    number: message.from,
+    name: message._data.notifyName,
+    body: '', 
+    type: message.type,
+    timestamp: new Date(),
+    userId: 'contatos',
+    media: media ? {
+    mimetype: media.mimetype,
+    filename: media.filename,
+    data: media.data // base64
+    } : null
+});
+      
   }
 
   
