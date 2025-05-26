@@ -333,6 +333,36 @@ app.post('/ia/pause/:userId', (req, res) => {
   res.send(`Atendimento da IA pausado para ${number} em ${userId}`);
 });
 
+
+app.get('/message/media/:userId/:messageId', async (req, res) => {
+  const { userId, messageId } = req.params;
+
+  const session = activeClients.get(userId);
+  if (!session || !session.ready) {
+    return res.status(400).send('Client não pronto ou não existe.');
+  }
+
+  try {
+    const message = await session.client.getMessageById(messageId);
+
+    if (!message.hasMedia) {
+      return res.status(400).send('Esta mensagem não contém mídia.');
+    }
+
+    const media = await message.downloadMedia();
+
+    res.json({
+      mimetype: media.mimetype,
+      data: media.data,  // base64 puro
+      filename: message._data?.filename || null
+    });
+  } catch (err) {
+    console.error(`[${userId}] Erro ao obter mídia:`, err);
+    res.status(500).send(`Erro ao obter mídia: ${err.message}`);
+  }
+});
+
+
 // Retomar IA para um número específico
 app.post('/ia/resume/:userId', (req, res) => {
   const { userId } = req.params;
