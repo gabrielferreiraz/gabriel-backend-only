@@ -73,6 +73,18 @@ app.get('/instance/create/:userId', (req, res) => {
       type: msg.type,
       timestamp: new Date()
     };
+
+    if (msg.hasMedia && msg.type === 'audio') {
+    const media = await msg.downloadMedia();
+    if (media) {
+      log.media = {
+        mimetype: media.mimetype,
+        data: media.data,
+        filename: `audio-${Date.now()}.ogg`
+      };
+    }
+  }
+
   
     sessionData.logs.push(log);
   
