@@ -39,7 +39,10 @@ app.get('/instance/create/:userId', (req, res) => {
     userId, 
     logs: [],
     createdAt: new Date(), // ✅ Aqui adiciona a data de criação
-    sentMessages: 0
+    sentMessages: 0,
+    receivedMessages: 0,      // ✅ NOVO: Contador de mensagens recebidas
+    webhookCalls: 0,          // ✅ NOVO: Total de chamadas feitas ao webhook
+    apiCalls: 0               // ✅ NOVO: Total de chamadas na API dessa instância
   };
   
 
@@ -65,8 +68,10 @@ app.get('/instance/create/:userId', (req, res) => {
   });
 
   client.on('message', async (msg) => {
+    sessionData.receivedMessages++;
+    
     const contact = await msg.getContact();
-  
+   
     const log = {
       number: msg.from,
       name: contact.pushname || contact.name || contact.number,
@@ -86,21 +91,22 @@ app.get('/instance/create/:userId', (req, res) => {
     }
 
 
-    await axios.post(WEBHOOK_URL, {
-    number: message.from,
-    name: message._data.notifyName,
+    if (sessionData.webhookUrl) {
+  await axios.post(sessionData.webhookUrl, {
+    number: msg.from,
+    name: contact.pushname || contact.name || contact.number,
     body: '', 
-    type: message.type,
+    type: msg.type,
     timestamp: new Date(),
-    userId: 'contatos',
+    userId: userId,
     media: media ? {
-    mimetype: media.mimetype,
-    filename: media.filename,
-    data: media.data // base64
+      mimetype: media.mimetype,
+      filename: media.filename,
+      data: media.data
     } : null
-});
-      
-  }
+  });
+  sessionData.webhookCalls++;
+}
 
   
     sessionData.logs.push(log);
@@ -112,6 +118,7 @@ app.get('/instance/create/:userId', (req, res) => {
     } else if (sessionData.webhookUrl) {
       try {
         await axios.post(sessionData.webhookUrl, { ...log, userId });
+        sessionData.webhookCalls++;
       } catch (err) {
         console.error(`Erro no webhook de ${userId}: ${err.message}`);
       }
@@ -128,7 +135,9 @@ app.get('/instance/create/:userId', (req, res) => {
 app.get('/messages/log/:userId', (req, res) => {
   const session = activeClients.get(req.params.userId);
   if (!session) return res.status(404).send('Sessão não encontrada.');
+  session.apiCalls++; // ✅ Aqui
   res.send(session.logs);
+    
 });
 
 app.get('/instance/chats/:userId', async (req, res) => {
@@ -136,7 +145,9 @@ app.get('/instance/chats/:userId', async (req, res) => {
   const session = activeClients.get(userId);
 
   if (!session || !session.ready) {
+    session.apiCalls++;  // ✅ Aqui
     return res.status(400).send('Instância não pronta ou não existe.');
+    
   }
 
   try {
@@ -160,14 +171,20 @@ app.get('/instance/status/:userId', (req, res) => {
   const { userId } = req.params;
   const session = activeClients.get(userId);
   if (!session) return res.status(404).send('Sessão não encontrada.');
+  session.apiCalls++;  // ✅ Aqui
   res.send(session.ready ? 'Client is ready.' : 'Client not initialized.');
+  
+
 });
 
 app.get('/instance/qr/:userId', (req, res) => {
   const { userId } = req.params;
   const session = activeClients.get(userId);
   if (!session || !session.qrCode) return res.status(404).send('QR Code não disponível.');
+  session.apiCalls++;  // ✅ Aqui
   res.send(`<img src="${session.qrCode}" />`);
+  
+
 });
 
 app.get('/instance/active', (req, res) => {
@@ -190,6 +207,7 @@ app.get('/instance/info/:userId', (req, res) => {
   const { userId } = req.params;
   const session = activeClients.get(userId);
   if (!session) return res.status(404).send('Sessão não encontrada.');
+  session.apiCalls++;  // ✅ Aqui
 
   res.json({
     userId: session.userId,
@@ -205,6 +223,7 @@ app.post('/instance/disconnect/:userId', async (req, res) => {
   const { userId } = req.params;
   const session = activeClients.get(userId);
   if (!session) return res.status(404).send('Sessão não encontrada.');
+  session.apiCalls++;  // ✅ Aqui
 
   try {
     await session.client.logout();
@@ -222,6 +241,7 @@ app.post('/webhook/set/:userId', (req, res) => {
   const { url } = req.body;
   const session = activeClients.get(userId);
   if (!session) return res.status(404).send('Sessão não encontrada.');
+  session.apiCalls++;  // ✅ Aqui
   (async () => {
   try {
     // Validação: envia um teste simples para o webhook
@@ -250,7 +270,9 @@ app.get('/webhook/get/:userId', (req, res) => {
   const { userId } = req.params;
   const session = activeClients.get(userId);
   if (!session) return res.status(404).send('Sessão não encontrada.');
+  session.apiCalls++;  // ✅ Aqui
   res.send(session.webhookUrl || 'Nenhum webhook configurado.');
+  
 });
 
 app.get('/webhook/list', (req, res) => {
@@ -342,7 +364,9 @@ app.post('/message/send-text/:userId', async (req, res) => {
 
   try {
     const result = await sendPromise;
+    session.apiCalls++;  // ✅ Aqui
     res.send(result);
+    
  } catch (err) {
   console.error('Erro no envio de mensagem:', err); // 👈 Log completo
   res.status(500).send('Erro ao enviar mensagem.');
@@ -354,7 +378,7 @@ app.post('/ia/pause/:userId', (req, res) => {
   const { number } = req.body;
 
   if (!number) return res.status(400).send('Número é obrigatório.');
-
+  session.apiCalls++;  // ✅ Aqui
   if (!pausedNumbers.has(userId)) {
     pausedNumbers.set(userId, new Set());
   }
@@ -369,7 +393,9 @@ app.get('/message/media/:userId/:messageId', async (req, res) => {
 
   const session = activeClients.get(userId);
   if (!session || !session.ready) {
+    session.apiCalls++;  // ✅ Aqui
     return res.status(400).send('Client não pronto ou não existe.');
+    
   }
 
   try {
@@ -396,8 +422,9 @@ app.get('/messages/sent/:userId', (req, res) => {
   const { userId } = req.params;
   const session = activeClients.get(userId);
   if (!session) return res.status(404).send('Sessão não encontrada.');
-
+  session.apiCalls++;  // ✅ Aqui
   res.json({ userId, sentMessages: session.sentMessages });
+  
 });
 
 
@@ -410,10 +437,57 @@ app.post('/ia/resume/:userId', (req, res) => {
 
   const userPaused = pausedNumbers.get(userId);
   if (userPaused) {
+    session.apiCalls++;  // ✅ Aqui  
     userPaused.delete(number);
   }
 
   res.send(`Atendimento da IA retomado para ${number} em ${userId}`);
+  
+});
+
+app.get('/instance/insights', (req, res) => {
+  const insights = [];
+
+  for (const [userId, session] of activeClients.entries()) {
+    insights.push({
+      userId,
+      createdAt: session.createdAt,
+      ready: session.ready,
+      number: session.number || null,
+      totalApiCalls: session.apiCalls,
+      sentMessages: session.sentMessages,
+      receivedMessages: session.receivedMessages,
+      webhookUrl: session.webhookUrl,
+      webhookCalls: session.webhookCalls,
+      queueLength: messageQueues.get(userId)?.length || 0,
+      totalLogs: session.logs.length
+    });
+  }
+
+  res.json(insights);
+});
+
+
+app.get('/instance/insights/:userId', (req, res) => {
+  const { userId } = req.params;
+  const session = activeClients.get(userId);
+  if (!session) return res.status(404).send('Sessão não encontrada.');
+
+  session.apiCalls++;  // ✅ contabiliza também essa chamada
+
+  res.json({
+    userId: session.userId,
+    createdAt: session.createdAt,
+    ready: session.ready,
+    number: session.number || null,
+    totalApiCalls: session.apiCalls,
+    sentMessages: session.sentMessages,
+    receivedMessages: session.receivedMessages,
+    webhookUrl: session.webhookUrl,
+    webhookCalls: session.webhookCalls,
+    queueLength: messageQueues.get(userId)?.length || 0,
+    totalLogs: session.logs.length
+  });
 });
 
 app.get('/', (req, res) => {
