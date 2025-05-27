@@ -80,7 +80,7 @@ app.get('/instance/create/:userId', (req, res) => {
       timestamp: new Date()
     };
 
-    if (msg.hasMedia && msg.type === 'ptt') {
+  if (msg.hasMedia && msg.type === 'ptt') {
     const media = await msg.downloadMedia();
     if (media) {
       log.media = {
@@ -90,40 +90,39 @@ app.get('/instance/create/:userId', (req, res) => {
       };
     }
 
-
     if (sessionData.webhookUrl) {
-  await axios.post(sessionData.webhookUrl, {
-    number: msg.from,
-    name: contact.pushname || contact.name || contact.number,
-    body: '', 
-    type: msg.type,
-    timestamp: new Date(),
-    userId: userId,
-    media: media ? {
-      mimetype: media.mimetype,
-      filename: media.filename,
-      data: media.data
-    } : null
-  });
-  sessionData.webhookCalls++;
-}
-
-  
-    sessionData.logs.push(log);
-  
-   const isPaused = pausedNumbers.get(userId)?.has(msg.from);
-
-    if (isPaused) {
-      console.log(`[IA PAUSADA] Mensagem de ${msg.from} ignorada pela IA.`);
-    } else if (sessionData.webhookUrl) {
-      try {
-        await axios.post(sessionData.webhookUrl, { ...log, userId });
-        sessionData.webhookCalls++;
-      } catch (err) {
-        console.error(`Erro no webhook de ${userId}: ${err.message}`);
-      }
+      await axios.post(sessionData.webhookUrl, {
+        number: msg.from,
+        name: contact.pushname || contact.name || contact.number,
+        body: '', 
+        type: msg.type,
+        timestamp: new Date(),
+        userId: userId,
+        media: media ? {
+          mimetype: media.mimetype,
+          filename: media.filename,
+          data: media.data
+        } : null
+      });
+      sessionData.webhookCalls++;
     }
-  });
+  }
+
+  sessionData.logs.push(log);
+
+  const isPaused = pausedNumbers.get(userId)?.has(msg.from);
+
+  if (isPaused) {
+    console.log(`[IA PAUSADA] Mensagem de ${msg.from} ignorada pela IA.`);
+  } else if (sessionData.webhookUrl) {
+    try {
+      await axios.post(sessionData.webhookUrl, { ...log, userId });
+      sessionData.webhookCalls++;
+    } catch (err) {
+      console.error(`Erro no webhook de ${userId}: ${err.message}`);
+    }
+  }
+});
 
   
   client.initialize();
