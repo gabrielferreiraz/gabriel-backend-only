@@ -77,10 +77,12 @@ app.get('/instance/create/:userId', (req, res) => {
       name: contact.pushname || contact.name || contact.number,
       body: msg.body,
       type: msg.type,
-      timestamp: new Date()
+      timestamp: new Date(),
+      media: null
     };
 
   if (msg.hasMedia && msg.type === 'ptt') {
+    try{
     const media = await msg.downloadMedia();
     if (media) {
       log.media = {
@@ -89,22 +91,8 @@ app.get('/instance/create/:userId', (req, res) => {
         filename: `audio-${Date.now()}.ogg`
       };
     }
-
-    if (sessionData.webhookUrl) {
-      await axios.post(sessionData.webhookUrl, {
-        number: msg.from,
-        name: contact.pushname || contact.name || contact.number,
-        body: '', 
-        type: msg.type,
-        timestamp: new Date(),
-        userId: userId,
-        media: media ? {
-          mimetype: media.mimetype,
-          filename: media.filename,
-          data: media.data
-        } : null
-      });
-      sessionData.webhookCalls++;
+    } catch (err){
+      console.error(`Erro ao baixar mídia: ${err.message}`)
     }
   }
 
