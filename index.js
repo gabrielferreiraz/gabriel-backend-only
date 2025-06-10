@@ -9,12 +9,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Função para gerar ID único
+// Função para gerar ID Único
 function generateUniqueId() {
   return crypto.randomUUID();
 }
 
-// Função para gerar ID único baseado em timestamp + random (alternativa)
 function generateTimestampId() {
   return `${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
 }
