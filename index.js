@@ -646,4 +646,21 @@ app.get('/', (_req, res) => {
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Backend multi-sessão com IDs únicos rodando na porta ${PORT}`));
+const server = app.listen(PORT, () => console.log(`Backend multi-sessão com IDs únicos rodando na porta ${PORT}`));
+
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM recebido, encerrando graciosamente...');
+  for (const [userId, session] of activeClients.entries()) {
+    try {
+      await session.client.destroy();
+    } catch (_) {}
+  }
+  server.close(() => {
+    console.log('Servidor encerrado.');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', async () => {
+  process.emit('SIGTERM');
+});
