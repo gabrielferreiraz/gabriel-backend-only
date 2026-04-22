@@ -1,5 +1,6 @@
 import express from "express"
-import { Client, LocalAuth, MessageMedia } from "whatsapp-web.js"
+import pkg from "whatsapp-web.js"
+const { Client, LocalAuth, MessageMedia } = pkg
 import cors from "cors"
 import qrcode from "qrcode"
 import * as nodeCrypto from "node:crypto"
