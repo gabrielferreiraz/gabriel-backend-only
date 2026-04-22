@@ -392,7 +392,7 @@ app.post('/instance/disconnect/:userId', async (req: Request, res: Response) => 
   }
 });
 
-app.all('/webhook/:rest*', (_req: Request, res: Response) => {
+app.all('/webhook/*splat', (_req: Request, res: Response) => {
   res.status(410).json({
     ok: false,
     error: "webhook_disabled",
