@@ -436,8 +436,8 @@ async function processQueue(userId: string) {
         continue;
       }
 
-      // Evita chamadas de typing/seen que podem quebrar em algumas versões do WhatsApp Web.
-      const sentMessage = await session.client.sendMessage(chatId, message);
+      // sendSeen: false evita o crash interno de 'markedUnread' no WhatsApp Web
+      const sentMessage = await session.client.sendMessage(chatId, message, { sendSeen: false });
       session.sentMessages += 1;
 
       // Registra a mensagem enviada
