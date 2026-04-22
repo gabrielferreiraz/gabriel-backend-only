@@ -334,7 +334,7 @@ app.post('/instance/disconnect/:userId', async (req, res) => {
   }
 });
 
-app.all('/webhook/:rest*', (_req, res) => {
+app.all('/webhook/{*path}', (_req, res) => {
   res.status(410).json({
     ok: false,
     error: "webhook_disabled",
