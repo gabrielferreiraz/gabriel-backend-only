@@ -2,11 +2,12 @@
   "name": "backend",
   "version": "2.0.0",
   "description": "API WhatsApp com IDs únicos para integração com n8n",
-  "main": "index.js",
+  "main": "index.ts",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start": "ts-node index.ts",
+    "dev": "nodemon --exec ts-node index.ts",
+    "build": "tsc"
   },
   "dependencies": {
     "axios": "^1.9.0",
@@ -18,10 +19,22 @@
     "whatsapp-web.js": "^1.27.0"
   },
   "devDependencies": {
-    "nodemon": "^3.0.0"
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.6.0",
+    "@types/qrcode": "^1.5.6",
+    "nodemon": "^3.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
   },
-  "keywords": ["whatsapp", "api", "n8n", "webhook", "unique-ids"],
+  "keywords": [
+    "whatsapp",
+    "api",
+    "n8n",
+    "webhook",
+    "unique-ids"
+  ],
   "author": "",
   "license": "ISC",
-  "type": "module"
+  "type": "commonjs"
 }
