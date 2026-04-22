@@ -23,5 +23,5 @@
   "keywords": ["whatsapp", "api", "n8n", "webhook", "unique-ids"],
   "author": "",
   "license": "ISC",
-  "type": "commonjs"
+  "type": "module"
 }
