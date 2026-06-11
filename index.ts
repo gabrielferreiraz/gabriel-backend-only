@@ -95,7 +95,11 @@ async function syncSessionReadiness(session: SessionData): Promise<string | null
     if (state === "CONNECTED") {
       session.ready = true
       session.authenticated = true
+    } else if (state !== null) {
+      // Estado conhecido mas não CONNECTED → definitivamente não está pronto
+      session.ready = false
     }
+    // state === null: getState() falhou, mantém o valor cacheado
     return state
   } catch (err) {
     session.lastError = err instanceof Error ? err.message : String(err)
