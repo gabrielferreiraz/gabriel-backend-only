@@ -1,7 +1,8 @@
 import express, { type Request, type Response } from "express"
-import { Client, LocalAuth } from "whatsapp-web.js"
+import { Client, LocalAuth, MessageMedia } from "whatsapp-web.js"
 import cors from "cors"
 import qrcode from "qrcode"
+import multer from "multer"
 import * as nodeCrypto from "node:crypto"
 
 const app = express()
@@ -10,8 +11,8 @@ app.use(express.json())
 
 type MediaLog = {
   mimetype: string
-  data: string
   filename: string
+  data?: string  // base64 — presente apenas em mídia recebida (PTT, etc.)
 }
 
 type MessageLog = {
@@ -34,6 +35,7 @@ type QueueItem = {
   number: string
   message: string
   messageId: string
+  media?: { base64: string; mimetype: string; filename: string }
   resolve: (value: SendResult) => void
   reject: (reason?: unknown) => void
 }
@@ -74,6 +76,24 @@ const messageRegistry = new Map<string, RegistryPayload>() // messageId => metad
 
 const MAX_REGISTRY_SIZE = 5000 // ~2.5 MB máximo; cobre ~50 min a 100 msgs/min
 const MAX_SESSION_LOGS = 1000  // por sessão; cobre ~20h a 50 msgs recebidas/hora
+
+const WHATSAPP_MEDIA_LIMIT_MB = 16  // limite oficial do WhatsApp para mídia
+const SEND_TIMEOUT_MS = 60_000     // 60s — cobre texto e imagem na mesma fila
+const ALLOWED_IMAGE_MIMETYPES = new Set([
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp'
+])
+
+const upload = multer({
+  storage: multer.memoryStorage(), // arquivo em RAM — sem disco, ideal para containers
+  limits: { fileSize: WHATSAPP_MEDIA_LIMIT_MB * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (ALLOWED_IMAGE_MIMETYPES.has(file.mimetype)) {
+      cb(null, true)
+    } else {
+      cb(new Error(`Tipo não suportado: ${file.mimetype}. Use JPEG, PNG, GIF ou WebP.`))
+    }
+  }
+})
 
 // Insere no Map respeitando o cap FIFO — O(1) graças à insertion-order do Map em JS
 function cappedMapSet<K, V>(map: Map<K, V>, key: K, value: V, maxSize: number): void {
@@ -440,8 +460,16 @@ async function processQueue(userId: string) {
 
         const chatId = numberId._serialized;
 
+        const sendPayload: string | MessageMedia = currentItem.media
+          ? new MessageMedia(
+              currentItem.media.mimetype,
+              currentItem.media.base64,
+              currentItem.media.filename
+            )
+          : message
+
         // sendSeen: false evita o crash interno de 'markedUnread' no WhatsApp Web
-        const sentMessage = await session.client.sendMessage(chatId, message, { sendSeen: false });
+        const sentMessage = await session.client.sendMessage(chatId, sendPayload, { sendSeen: false });
         session.sentMessages += 1;
 
         cappedMapSet(messageRegistry, messageId, {
@@ -459,11 +487,13 @@ async function processQueue(userId: string) {
           instanceId: session.instanceId,
           number,
           name: number,
-          body: message,
-          type: 'chat',
+          body: currentItem.media ? `[imagem: ${currentItem.media.filename}]` : message,
+          type: currentItem.media ? 'image' : 'chat',
           direction: 'sent',
           timestamp: new Date(),
-          media: null,
+          media: currentItem.media
+            ? { mimetype: currentItem.media.mimetype, filename: currentItem.media.filename }
+            : null,
           whatsappMessageId: sentMessage.id._serialized
         })
         if (session.logs.length > MAX_SESSION_LOGS) session.logs.shift()
@@ -471,7 +501,7 @@ async function processQueue(userId: string) {
         resolve({
           success: true,
           messageId,
-          message: 'Mensagem enviada!',
+          message: currentItem.media ? 'Imagem enviada!' : 'Mensagem enviada!',
           whatsappMessageId: sentMessage.id._serialized
         });
       } catch (err: any) {
@@ -519,7 +549,12 @@ app.post('/message/send-text/:userId', async (req: Request, res: Response) => {
   processQueue(userId);
 
   try {
-    const result: SendResult = await sendPromise;
+    const result: SendResult = await Promise.race([
+      sendPromise,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Tempo limite excedido. Tente novamente.')), SEND_TIMEOUT_MS)
+      )
+    ])
     res.json({
       ...result,
       userId,
@@ -536,6 +571,95 @@ app.post('/message/send-text/:userId', async (req: Request, res: Response) => {
     });
   }
 });
+
+app.post('/message/send-image/:userId', async (req: Request, res: Response) => {
+  const userId = getParam(req.params.userId)
+
+  // Valida a sessão antes de consumir o upload — evita alocar buffer de até 16MB para userId inválido
+  const session = activeClients.get(userId)
+  if (!session) return res.status(404).send('Sessão não encontrada.')
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      upload.single('image')(req, res, (err: unknown) => (err ? reject(err) : resolve()))
+    })
+  } catch (err: any) {
+    const isSizeError = err?.code === 'LIMIT_FILE_SIZE'
+    return res.status(400).json({
+      ok: false,
+      error: 'invalid_file',
+      details: isSizeError
+        ? `Arquivo muito grande. Máximo ${WHATSAPP_MEDIA_LIMIT_MB}MB.`
+        : err.message ?? 'Arquivo inválido.'
+    })
+  }
+
+  const number = String(req.body.number ?? '').trim()
+  const caption = String(req.body.caption ?? '').trim()
+
+  if (!number) {
+    return res.status(400).json({
+      ok: false,
+      error: 'invalid_payload',
+      details: "Campo 'number' é obrigatório.",
+      example: { number: '5511999999999' }
+    })
+  }
+
+  if (!req.file) {
+    return res.status(400).json({
+      ok: false,
+      error: 'invalid_payload',
+      details: "Campo 'image' (arquivo) é obrigatório."
+    })
+  }
+
+  session.apiCalls++
+
+  await syncSessionReadiness(session)
+  if (!session.ready) return res.status(400).send('Instância não pronta.')
+
+  if (!messageQueues.has(userId)) messageQueues.set(userId, [])
+
+  const messageId = generateUniqueId()
+  const base64 = req.file.buffer.toString('base64')
+  const ext = req.file.mimetype.split('/')[1]?.replace('jpeg', 'jpg') ?? 'jpg'
+  // Remove separadores de caminho do nome original para evitar sequências como "../../"
+  const safeName = (req.file.originalname ?? '').trim().replace(/[/\\]/g, '').replace(/\.\./g, '').trim()
+  const filename = safeName || `image-${Date.now()}.${ext}`
+
+  const sendPromise = new Promise<SendResult>((resolve, reject) => {
+    messageQueues.get(userId)!.push({
+      number,
+      message: caption,
+      messageId,
+      media: { base64, mimetype: req.file!.mimetype, filename },
+      resolve,
+      reject
+    })
+  })
+
+  processQueue(userId)
+
+  try {
+    const result = await Promise.race([
+      sendPromise,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Tempo limite excedido. Tente novamente.')), SEND_TIMEOUT_MS)
+      )
+    ])
+    res.json({ ...result, userId, instanceId: session.instanceId })
+  } catch (err: any) {
+    console.error(`[${userId}] Erro ao enviar imagem para ${number}:`, err)
+    const errorMessage = err instanceof Error ? err.message : String(err)
+    res.status(500).json({
+      error: 'Erro ao enviar imagem.',
+      details: errorMessage,
+      userId,
+      instanceId: session.instanceId
+    })
+  }
+})
 
 app.post('/ia/pause/:userId', (req: Request, res: Response) => {
   const userId = getParam(req.params.userId);
