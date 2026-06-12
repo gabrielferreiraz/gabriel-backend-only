@@ -141,7 +141,15 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
     authStrategy: new LocalAuth({ clientId: userId }),
     puppeteer: {
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',   // evita crash quando /dev/shm < 64MB no Docker
+        '--disable-gpu',             // sem GPU em containers headless
+        '--no-zygote',               // reduz processos filhos do Chrome, mais estável em container
+        '--disable-extensions',
+        '--no-first-run',
+      ],
       executablePath: require('puppeteer').executablePath()
     }
   });
@@ -215,57 +223,62 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
   })
 
   client.on('message', async (msg: any) => {
-    sessionData.receivedMessages++;
+    try {
+      sessionData.receivedMessages++;
 
-    const contact = await msg.getContact();
+      const contact = await msg.getContact().catch(() => null);
+      const contactName = contact?.pushname || contact?.name || contact?.number || msg.from
 
-    // Gera ID único para cada mensagem recebida
-    const messageId = generateUniqueId();
+      // Gera ID único para cada mensagem recebida
+      const messageId = generateUniqueId();
 
-    cappedMapSet(messageRegistry, messageId, {
-      userId,
-      instanceId,
-      timestamp: new Date(),
-      type: 'received',
-      whatsappMessageId: msg.id._serialized
-    }, MAX_REGISTRY_SIZE);
+      cappedMapSet(messageRegistry, messageId, {
+        userId,
+        instanceId,
+        timestamp: new Date(),
+        type: 'received',
+        whatsappMessageId: msg.id._serialized
+      }, MAX_REGISTRY_SIZE);
 
-    const log: MessageLog = {
-      messageId,
-      userId,
-      instanceId,
-      number: msg.from,
-      name: contact.pushname || contact.name || contact.number,
-      body: msg.body,
-      type: msg.type,
-      direction: 'received',
-      timestamp: new Date(),
-      media: null,
-      whatsappMessageId: msg.id._serialized
-    };
+      const log: MessageLog = {
+        messageId,
+        userId,
+        instanceId,
+        number: msg.from,
+        name: contactName,
+        body: msg.body,
+        type: msg.type,
+        direction: 'received',
+        timestamp: new Date(),
+        media: null,
+        whatsappMessageId: msg.id._serialized
+      };
 
-    if (msg.hasMedia && msg.type === 'ptt') {
-      try {
-        const media = await msg.downloadMedia();
-        if (media) {
-          log.media = {
-            mimetype: media.mimetype,
-            data: media.data,
-            filename: `audio-${Date.now()}.ogg`
-          };
+      if (msg.hasMedia && msg.type === 'ptt') {
+        try {
+          const media = await msg.downloadMedia();
+          if (media) {
+            log.media = {
+              mimetype: media.mimetype,
+              data: media.data,
+              filename: `audio-${Date.now()}.ogg`
+            };
+          }
+        } catch (err: any) {
+          console.error(`Erro ao baixar mídia: ${err?.message}`);
         }
-      } catch (err: any) {
-        console.error(`Erro ao baixar mídia: ${err?.message}`);
       }
-    }
 
-    sessionData.logs.push(log)
-    if (sessionData.logs.length > MAX_SESSION_LOGS) sessionData.logs.shift()
+      sessionData.logs.push(log)
+      if (sessionData.logs.length > MAX_SESSION_LOGS) sessionData.logs.shift()
 
-    const isPaused = pausedNumbers.get(userId)?.has(msg.from);
+      const isPaused = pausedNumbers.get(userId)?.has(msg.from);
 
-    if (isPaused) {
-      console.log(`[IA PAUSADA] Mensagem de ${msg.from} ignorada pela IA.`);
+      if (isPaused) {
+        console.log(`[IA PAUSADA] Mensagem de ${msg.from} ignorada pela IA.`);
+      }
+    } catch (err: any) {
+      console.error(`[${userId}] Erro ao processar mensagem recebida:`, err?.message ?? err);
     }
   });
 
