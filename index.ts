@@ -347,9 +347,13 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
         const controller = new AbortController()
         const timer = setTimeout(() => controller.abort(), 5000)
         try {
+          const webhookSecret = process.env.WEBHOOK_SECRET
+          const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+          if (webhookSecret) headers['Authorization'] = `Bearer ${webhookSecret}`
+
           const webhookRes = await fetch(webhookUrl, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers,
             signal: controller.signal,
             body: JSON.stringify({
               userId,
