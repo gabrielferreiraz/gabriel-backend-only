@@ -1,4 +1,4 @@
-import express, { type Request, type Response } from "express"
+import express, { type Request, type Response, type NextFunction } from "express"
 import { Client, LocalAuth, MessageMedia } from "whatsapp-web.js"
 import cors from "cors"
 import qrcode from "qrcode"
@@ -8,6 +8,30 @@ import * as nodeCrypto from "node:crypto"
 const app = express()
 app.use(cors())
 app.use(express.json())
+
+// --- Autenticação por API Key ---
+// Configure API_KEY como variável de ambiente no EasyPanel.
+// Todas as rotas (exceto GET /) exigem: Authorization: Bearer <sua-chave>
+const API_KEY = process.env.API_KEY ?? ''
+
+if (!API_KEY) {
+  console.warn('[SEGURANÇA] API_KEY não configurada — servidor acessível sem autenticação. Defina API_KEY nas variáveis de ambiente.')
+}
+
+function authMiddleware(req: Request, res: Response, next: NextFunction) {
+  if (!API_KEY) return next()
+  const auth = req.headers.authorization
+  if (!auth || auth !== `Bearer ${API_KEY}`) {
+    return res.status(401).json({ ok: false, error: 'unauthorized', details: 'API key inválida ou ausente. Envie o header: Authorization: Bearer <sua-chave>' })
+  }
+  next()
+}
+
+// Protege todas as rotas operacionais. GET / (health check) fica sem auth intencionalmente.
+app.use('/instance', authMiddleware)
+app.use('/message', authMiddleware)
+app.use('/messages', authMiddleware)
+app.use('/ia', authMiddleware)
 
 type MediaLog = {
   mimetype: string
@@ -170,6 +194,13 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
     apiCalls: 0
   };
 
+  // Contadores de eventos para detecção de loop de inicialização.
+  // whatsapp-web.js pode disparar ready/authenticated múltiplas vezes quando o WA Web
+  // fica recarregando — cada ciclo gera uma nova autenticação nos servidores do WA,
+  // o que aciona o sistema anti-bot e resulta em ban do número.
+  let readyCount = 0
+  let destroyingDueToLoop = false
+
   client.on('qr', (qr: string) => {
     qrcode.toDataURL(qr, (err: Error | null | undefined, url: string) => {
       if (err) {
@@ -181,6 +212,21 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
   });
 
   client.on('ready', () => {
+    readyCount++
+
+    if (readyCount > 2) {
+      if (!destroyingDueToLoop) {
+        destroyingDueToLoop = true
+        console.error(`[${userId}] Loop de inicialização detectado (ready #${readyCount}) — encerrando sessão para proteger o número.`)
+        sessionData.ready = false
+        sessionData.authenticated = false
+        sessionData.lastKnownState = 'DISCONNECTED'
+        sessionData.lastError = `Loop de inicialização detectado após ${readyCount} eventos ready. Reinicie a sessão manualmente via /instance/disconnect/${userId} e /instance/create/${userId}.`
+        client.destroy().catch(() => {})
+      }
+      return
+    }
+
     sessionData.ready = true;
     sessionData.authenticated = true;
     sessionData.lastKnownState = "CONNECTED";
@@ -188,9 +234,12 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
     sessionData.number = client.info.wid.user;
     console.log(`[${userId}] Pronto - Número conectado: ${sessionData.number}`);
     console.log(`[${userId}] Instance ID: ${instanceId}`);
+    // Retoma fila caso tenha itens pendentes de antes da reconexão
+    processQueue(userId)
   });
 
   client.on('authenticated', () => {
+    if (destroyingDueToLoop) return
     sessionData.authenticated = true;
     sessionData.lastError = null;
     console.log(`[${userId}] Autenticado`);
@@ -208,6 +257,8 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
     if (state === "CONNECTED") {
       sessionData.ready = true
       sessionData.authenticated = true
+      // Retoma a fila caso a sessão tenha reconectado com itens pendentes
+      processQueue(userId)
     }
     if (state === "UNPAIRED" || state === "UNPAIRED_IDLE" || state === "DISCONNECTED") {
       sessionData.ready = false
@@ -220,6 +271,17 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
     sessionData.lastKnownState = "DISCONNECTED"
     sessionData.lastError = reason || null
     console.warn(`[${userId}] Desconectado: ${reason}`)
+
+    // Rejeita imediatamente todos os itens pendentes na fila para que os
+    // HTTP handlers recebam erro na hora, sem esperar o timeout de 60s
+    const queue = messageQueues.get(userId)
+    if (queue && queue.length > 0) {
+      const pending = queue.splice(0)
+      console.warn(`[${userId}] Rejeitando ${pending.length} mensagens pendentes na fila por desconexão.`)
+      for (const item of pending) {
+        item.reject(new Error('Sessão desconectada. Tente novamente.'))
+      }
+    }
   })
 
   client.on('message', async (msg: any) => {
@@ -277,6 +339,35 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
       if (isPaused) {
         console.log(`[IA PAUSADA] Mensagem de ${msg.from} ignorada pela IA.`);
       }
+
+      // Webhook — notifica sistema externo sobre mensagem recebida.
+      // Ignora mensagens próprias e de grupos. Falha silenciosa — nunca afeta a instância.
+      const webhookUrl = process.env.WEBHOOK_URL
+      if (webhookUrl && !msg.fromMe && !msg.from.endsWith('@g.us')) {
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), 5000)
+        try {
+          const webhookRes = await fetch(webhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify({
+              userId,
+              instanceId,
+              from: msg.from.replace('@c.us', ''),
+              body: msg.body ?? '',
+              timestamp: msg.timestamp,
+            }),
+          })
+          if (!webhookRes.ok) {
+            console.error(`[${userId}] webhook retornou status ${webhookRes.status}`)
+          }
+        } catch (err: any) {
+          console.error(`[${userId}] webhook falhou:`, err?.message ?? err)
+        } finally {
+          clearTimeout(timer)
+        }
+      }
     } catch (err: any) {
       console.error(`[${userId}] Erro ao processar mensagem recebida:`, err?.message ?? err);
     }
@@ -299,9 +390,25 @@ app.get('/messages/log/:userId', (req: Request, res: Response) => {
   session.apiCalls++;
 
   const direction = getParam(req.query.direction as string | undefined)
-  const logs = direction === 'sent' || direction === 'received'
+  const number    = getParam(req.query.number as string | undefined).trim()
+  const since     = getParam(req.query.since as string | undefined).trim()
+
+  const sinceDate = since ? new Date(since) : null
+  const sinceValid = sinceDate && !isNaN(sinceDate.getTime())
+
+  let logs = direction === 'sent' || direction === 'received'
     ? session.logs.filter(l => l.direction === direction)
     : session.logs
+
+  // Filtra por número específico — usado pelo sistema de remarketing para detectar resposta
+  if (number) {
+    logs = logs.filter(l => l.number === number || l.number === `${number}@c.us`)
+  }
+
+  // Filtra por timestamp — evita baixar todo o histórico a cada ciclo de polling
+  if (sinceValid) {
+    logs = logs.filter(l => new Date(l.timestamp) > sinceDate!)
+  }
 
   res.json({
     userId,
@@ -855,6 +962,36 @@ app.get('/', (_req: Request, res: Response) => {
     features: ['Unique IDs', 'Message Registry', 'Instance Tracking', 'Webhook Disabled']
   });
 });
+
+// Handlers globais de processo — impedem que erros internos do whatsapp-web.js/Puppeteer
+// (ex: "Execution context was destroyed") derrubem o servidor inteiro.
+// O processo permanece vivo; a sessão afetada fica com ready=false e pode ser reiniciada via API.
+process.on('uncaughtException', (err: Error) => {
+  console.error('[PROCESSO] Exceção não capturada — servidor mantido vivo:', err.message)
+})
+
+process.on('unhandledRejection', (reason: unknown) => {
+  const msg = reason instanceof Error ? reason.message : String(reason)
+  console.error('[PROCESSO] Rejeição não tratada — servidor mantido vivo:', msg)
+})
+
+// Graceful shutdown — encerra todos os processos Chromium antes de sair,
+// evitando processos órfãos que acumulam RAM/CPU entre deploys no Docker.
+async function gracefulShutdown(signal: string) {
+  console.log(`[SHUTDOWN] Sinal ${signal} recebido. Encerrando ${activeClients.size} sessão(ões)...`)
+  for (const [userId, session] of activeClients.entries()) {
+    try {
+      await session.client.destroy()
+      console.log(`[SHUTDOWN] Sessão ${userId} encerrada.`)
+    } catch {
+      // ignora — processo vai encerrar de qualquer forma
+    }
+  }
+  process.exit(0)
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'))
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Backend multi-sessão com IDs únicos rodando na porta ${PORT}`));
