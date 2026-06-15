@@ -720,8 +720,23 @@ async function processQueue(userId: string) {
         const sendOptions: Record<string, unknown> = { sendSeen: false }
         if (currentItem.media?.ptt) sendOptions.sendAudioAsVoice = true
 
-        // sendSeen: false evita o crash interno de 'markedUnread' no WhatsApp Web
-        const sentMessage = await session.client.sendMessage(chatId, sendPayload, sendOptions);
+        // Retry para "WidFactory undefined" — o evento ready pode disparar antes das factories
+        // internas do WA estarem prontas; se isso ocorrer, reintenta até 3 vezes com 3s de pausa.
+        let sentMessage: any
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            // sendSeen: false evita o crash interno de 'markedUnread' no WhatsApp Web
+            sentMessage = await session.client.sendMessage(chatId, sendPayload, sendOptions)
+            break
+          } catch (err: any) {
+            if (err?.message?.includes('WidFactory') && attempt < 3) {
+              console.warn(`[${ts()}] [${userId}] WidFactory não pronta (tentativa ${attempt}/3) — aguardando 3s`)
+              await new Promise<void>(r => setTimeout(r, 3000))
+            } else {
+              throw err
+            }
+          }
+        }
         session.sentMessages += 1;
 
         const ms = Date.now() - t0
