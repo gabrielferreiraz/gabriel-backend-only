@@ -138,6 +138,11 @@ const ALLOWED_AUDIO_MIMETYPES = new Set([
   'audio/wav', 'audio/wave', 'audio/x-wav', 'audio/aac', 'audio/webm'
 ])
 
+// Tipos gerados pelo próprio WhatsApp (sistema, broadcast, chamadas) — nunca devem ir ao webhook
+const IGNORED_WEBHOOK_TYPES = new Set([
+  'notification_template', 'notification', 'e2e_notification', 'call_log', 'protocol',
+])
+
 const upload = multer({
   storage: multer.memoryStorage(), // arquivo em RAM — sem disco, ideal para containers
   limits: { fileSize: WHATSAPP_MEDIA_LIMIT_MB * 1024 * 1024 },
@@ -385,7 +390,10 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
 
       const contact = await msg.getContact().catch(() => null);
       const contactName = contact?.pushname || contact?.name || contact?.number || msg.from
-      const from = msg.from.replace('@c.us', '')
+      // LID (@lid) é o novo identificador interno do WA — resolve para o número real via contato
+      const from = msg.from.endsWith('@lid')
+        ? (contact?.number ?? msg.from.replace('@lid', ''))
+        : msg.from.replace('@c.us', '')
       const rawBody = msg.body ?? ''
       const preview = rawBody.slice(0, 80).replace(/\n/g, ' ')
       const previewFmt = msg.type === 'ptt'
@@ -447,7 +455,7 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
       // Webhook — notifica sistema externo sobre mensagem recebida.
       // Ignora mensagens próprias e de grupos. Falha silenciosa — nunca afeta a instância.
       const webhookUrl = process.env.WEBHOOK_URL
-      if (webhookUrl && !msg.fromMe && !msg.from.endsWith('@g.us')) {
+      if (webhookUrl && !msg.fromMe && !msg.from.endsWith('@g.us') && !IGNORED_WEBHOOK_TYPES.has(msg.type)) {
         const controller = new AbortController()
         const timer = setTimeout(() => controller.abort(), 5000)
         const t0 = Date.now()
