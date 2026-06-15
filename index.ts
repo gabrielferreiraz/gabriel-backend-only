@@ -173,7 +173,16 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
   const userId = getParam(req.params.userId);
 
   if (activeClients.has(userId)) {
-    return res.status(400).send('Já existe uma sessão para este usuário.');
+    const existing = activeClients.get(userId)!
+    return res.status(200).json({
+      message: 'Sessão já existe',
+      status: 'existing',
+      userId,
+      instanceId: existing.instanceId,
+      ready: existing.ready,
+      authenticated: existing.authenticated,
+      state: existing.lastKnownState,
+    })
   }
 
   // Gera um ID único para a instância
