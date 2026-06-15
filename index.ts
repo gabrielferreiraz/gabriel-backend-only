@@ -9,6 +9,19 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
+// Log de cada requisição HTTP com método, rota, status e duração
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const start = Date.now()
+  res.on('finish', () => {
+    const ms = Date.now() - start
+    const line = `[${ts()}] [HTTP] ${req.method} ${req.path} → ${res.statusCode} (${ms}ms)`
+    if (res.statusCode >= 500) console.error(line)
+    else if (res.statusCode >= 400) console.warn(line)
+    else console.log(line)
+  })
+  next()
+})
+
 // --- Autenticação por API Key ---
 // Configure API_KEY como variável de ambiente no EasyPanel.
 // Todas as rotas (exceto GET /) exigem: Authorization: Bearer <sua-chave>
@@ -90,6 +103,20 @@ type SessionData = {
 
 function generateUniqueId() {
   return nodeCrypto.randomUUID()
+}
+
+// Timestamp compacto ISO 8601 — prefixo padrão de todos os logs
+function ts(): string {
+  return new Date().toISOString().replace('T', ' ').slice(0, 23)
+}
+
+// Rótulos legíveis para os acks do WhatsApp
+const ACK_LABELS: Record<number, string> = {
+  0: 'pendente',
+  1: 'enviada',
+  2: 'entregue',
+  3: 'lida',
+  4: 'reproduzida',
 }
 
 const activeClients = new Map<string, SessionData>() // userId → sessão ativa
@@ -174,6 +201,7 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
 
   if (activeClients.has(userId)) {
     const existing = activeClients.get(userId)!
+    console.log(`[${ts()}] [${userId}] Sessão já existe — ready=${existing.ready} state=${existing.lastKnownState ?? '?'} msgs_enviadas=${existing.sentMessages}`)
     return res.status(200).json({
       message: 'Sessão já existe',
       status: 'existing',
@@ -187,6 +215,7 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
 
   // Gera um ID único para a instância
   const instanceId = generateUniqueId();
+  console.log(`[${ts()}] [${userId}] Criando nova sessão (instanceId: ${instanceId})...`)
 
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: userId }),
@@ -231,10 +260,11 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
   client.on('qr', (qr: string) => {
     qrcode.toDataURL(qr, (err: Error | null | undefined, url: string) => {
       if (err) {
-        console.error('Erro ao gerar QR Code:', err);
+        console.error(`[${ts()}] [${userId}] Erro ao gerar QR Code:`, err);
         return;
       }
       sessionData.qrCode = url;
+      console.log(`[${ts()}] [${userId}] QR Code gerado — aguardando scan no WhatsApp`);
     });
   });
 
@@ -244,7 +274,7 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
     if (readyCount > 2) {
       if (!destroyingDueToLoop) {
         destroyingDueToLoop = true
-        console.error(`[${userId}] Loop de inicialização detectado (ready #${readyCount}) — encerrando sessão para proteger o número.`)
+        console.error(`[${ts()}] [${userId}] LOOP DE INICIALIZAÇÃO detectado (ready #${readyCount}) — encerrando sessão para proteger o número`)
         sessionData.ready = false
         sessionData.authenticated = false
         sessionData.lastKnownState = 'DISCONNECTED'
@@ -254,13 +284,13 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
       return
     }
 
+    const uptimeSec = Math.round((Date.now() - sessionData.createdAt.getTime()) / 1000)
     sessionData.ready = true;
     sessionData.authenticated = true;
     sessionData.lastKnownState = "CONNECTED";
     sessionData.lastError = null;
     sessionData.number = client.info.wid.user;
-    console.log(`[${userId}] Pronto - Número conectado: ${sessionData.number}`);
-    console.log(`[${userId}] Instance ID: ${instanceId}`);
+    console.log(`[${ts()}] [${userId}] PRONTO — número: ${sessionData.number} | instanceId: ${instanceId} | uptime: ${uptimeSec}s`);
     // Retoma fila caso tenha itens pendentes de antes da reconexão
     processQueue(userId)
   });
@@ -269,18 +299,20 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
     if (destroyingDueToLoop) return
     sessionData.authenticated = true;
     sessionData.lastError = null;
-    console.log(`[${userId}] Autenticado`);
+    console.log(`[${ts()}] [${userId}] Autenticado (aguardando evento ready...)`);
   });
 
   client.on("auth_failure", (message: string) => {
     sessionData.ready = false
     sessionData.authenticated = false
     sessionData.lastError = message || "auth_failure"
-    console.error(`[${userId}] Falha de autenticação: ${message}`)
+    console.error(`[${ts()}] [${userId}] FALHA DE AUTENTICAÇÃO: ${message}`)
   })
 
   client.on("change_state", (state: string) => {
+    const prev = sessionData.lastKnownState ?? '?'
     sessionData.lastKnownState = state
+    console.log(`[${ts()}] [${userId}] Estado: ${prev} → ${state}`)
     if (state === "CONNECTED") {
       sessionData.ready = true
       sessionData.authenticated = true
@@ -297,14 +329,14 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
     sessionData.authenticated = false
     sessionData.lastKnownState = "DISCONNECTED"
     sessionData.lastError = reason || null
-    console.warn(`[${userId}] Desconectado: ${reason}`)
+    console.warn(`[${ts()}] [${userId}] DESCONECTADO: ${reason || '(sem motivo)'}`)
 
     // Rejeita imediatamente todos os itens pendentes na fila para que os
     // HTTP handlers recebam erro na hora, sem esperar o timeout de 60s
     const queue = messageQueues.get(userId)
     if (queue && queue.length > 0) {
       const pending = queue.splice(0)
-      console.warn(`[${userId}] Rejeitando ${pending.length} mensagens pendentes na fila por desconexão.`)
+      console.warn(`[${ts()}] [${userId}] Fila drenada: ${pending.length} mensagem(ns) rejeitada(s) por desconexão`)
       for (const item of pending) {
         item.reject(new Error('Sessão desconectada. Tente novamente.'))
       }
@@ -318,8 +350,12 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
     if (!senderwhatsUrl) return
 
     const messageId = msg.id._serialized
-    const webhookSecret = process.env.WEBHOOK_SECRET
+    const ackName = ACK_LABELS[ack] ?? `ack-${ack}`
+    const msgShort = messageId.slice(-10)
+    console.log(`[${ts()}] [${userId}] ACK ...${msgShort} → ${ackName}`)
 
+    const webhookSecret = process.env.WEBHOOK_SECRET
+    const t0 = Date.now()
     try {
       const res = await fetch(`${senderwhatsUrl}/api/webhooks/message-ack`, {
         method: 'POST',
@@ -332,11 +368,13 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
       })
 
       if (!res.ok) {
-        console.warn(`[${userId}] ack-webhook retornou ${res.status} para msg ${messageId}`)
+        console.warn(`[${ts()}] [${userId}] ack-webhook → ${res.status} para ...${msgShort} (${Date.now() - t0}ms)`)
+      } else {
+        console.log(`[${ts()}] [${userId}] ack-webhook → OK para ...${msgShort} (${Date.now() - t0}ms)`)
       }
     } catch (err) {
       if (err instanceof Error && err.name !== 'TimeoutError' && err.name !== 'AbortError') {
-        console.error(`[${userId}] ack-webhook erro inesperado para ${messageId}:`, err.message)
+        console.error(`[${ts()}] [${userId}] ack-webhook erro para ...${msgShort}:`, err.message)
       }
     }
   })
@@ -347,6 +385,15 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
 
       const contact = await msg.getContact().catch(() => null);
       const contactName = contact?.pushname || contact?.name || contact?.number || msg.from
+      const from = msg.from.replace('@c.us', '')
+      const rawBody = msg.body ?? ''
+      const preview = rawBody.slice(0, 80).replace(/\n/g, ' ')
+      const previewFmt = msg.type === 'ptt'
+        ? '[ptt/áudio]'
+        : rawBody.length > 0
+          ? `"${preview}${rawBody.length > 80 ? '...' : ''}"`
+          : `[${msg.type}]`
+      console.log(`[${ts()}] [${userId}] ← de ${from} (${contactName}) ${previewFmt} | total recebidas: ${sessionData.receivedMessages}`)
 
       // Gera ID único para cada mensagem recebida
       const messageId = generateUniqueId();
@@ -382,9 +429,10 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
               data: media.data,
               filename: `audio-${Date.now()}.ogg`
             };
+            console.log(`[${ts()}] [${userId}] PTT recebido de ${from} — download OK`)
           }
         } catch (err: any) {
-          console.error(`Erro ao baixar mídia: ${err?.message}`);
+          console.error(`[${ts()}] [${userId}] Erro ao baixar PTT de ${from}: ${err?.message}`);
         }
       }
 
@@ -392,9 +440,8 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
       if (sessionData.logs.length > MAX_SESSION_LOGS) sessionData.logs.shift()
 
       const isPaused = pausedNumbers.get(userId)?.has(msg.from);
-
       if (isPaused) {
-        console.log(`[IA PAUSADA] Mensagem de ${msg.from} ignorada pela IA.`);
+        console.log(`[${ts()}] [${userId}] IA pausada para ${from} — mensagem registrada mas ignorada pela IA`);
       }
 
       // Webhook — notifica sistema externo sobre mensagem recebida.
@@ -403,6 +450,7 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
       if (webhookUrl && !msg.fromMe && !msg.from.endsWith('@g.us')) {
         const controller = new AbortController()
         const timer = setTimeout(() => controller.abort(), 5000)
+        const t0 = Date.now()
         try {
           const webhookSecret = process.env.WEBHOOK_SECRET
           const headers: Record<string, string> = { 'Content-Type': 'application/json' }
@@ -415,27 +463,31 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
             body: JSON.stringify({
               userId,
               instanceId,
-              from: msg.from.replace('@c.us', ''),
-              body: msg.body ?? '',
+              from,
+              body: rawBody,
               timestamp: msg.timestamp,
             }),
           })
+          const ms = Date.now() - t0
           if (!webhookRes.ok) {
-            console.error(`[${userId}] webhook retornou status ${webhookRes.status}`)
+            console.error(`[${ts()}] [${userId}] webhook → ${webhookRes.status} (${ms}ms)`)
+          } else {
+            console.log(`[${ts()}] [${userId}] webhook → OK (${ms}ms)`)
           }
         } catch (err: any) {
-          console.error(`[${userId}] webhook falhou:`, err?.message ?? err)
+          console.error(`[${ts()}] [${userId}] webhook falhou (${Date.now() - t0}ms):`, err?.message ?? err)
         } finally {
           clearTimeout(timer)
         }
       }
     } catch (err: any) {
-      console.error(`[${userId}] Erro ao processar mensagem recebida:`, err?.message ?? err);
+      console.error(`[${ts()}] [${userId}] Erro ao processar mensagem recebida:`, err?.message ?? err);
     }
   });
 
   client.initialize();
   activeClients.set(userId, sessionData);
+  console.log(`[${ts()}] [${userId}] Cliente inicializado — aguardando QR ou autenticação automática`)
 
   res.status(200).json({
     message: `Instância '${userId}' criada com sucesso.`,
@@ -585,6 +637,8 @@ app.post('/instance/disconnect/:userId', async (req: Request, res: Response) => 
   if (!session) return res.status(404).send('Sessão não encontrada.');
   session.apiCalls++;
 
+  console.log(`[${ts()}] [${userId}] Desconectando sessão (instanceId: ${session.instanceId})...`)
+
   try {
     await session.client.logout();
     await session.client.destroy();
@@ -596,6 +650,8 @@ app.post('/instance/disconnect/:userId', async (req: Request, res: Response) => 
   pausedNumbers.delete(userId)
   messageQueues.delete(userId)
   isSendingMessage.delete(userId)
+
+  console.log(`[${ts()}] [${userId}] Sessão removida — enviadas: ${session.sentMessages} | recebidas: ${session.receivedMessages} | chamadas API: ${session.apiCalls}`)
 
   res.json({
     message: `Sessão ${userId} desconectada.`,
@@ -622,19 +678,23 @@ async function processQueue(userId: string) {
   if (!queue || queue.length === 0) return;
 
   isSendingMessage.set(userId, true);
+  console.log(`[${ts()}] [${userId}] Fila iniciada — ${queue.length} item(ns) pendente(s)`)
 
   try {
     while (queue.length > 0) {
       const currentItem = queue.shift()
       if (!currentItem) continue
       const { number, message, messageId, resolve, reject } = currentItem;
+      const type = currentItem.media?.ptt ? 'ptt' : currentItem.media ? 'image' : 'text'
+      const t0 = Date.now()
+      console.log(`[${ts()}] [${userId}] → enviando ${type} para ${number} | fila restante: ${queue.length}`)
 
       try {
         // getNumberId resolve o LID para contas na nova infra do WhatsApp (evita "No LID for user")
         const numberId = await session.client.getNumberId(number);
 
         if (!numberId) {
-          console.error(`[${userId}] Número inválido ou não registrado no WhatsApp: ${number}`);
+          console.warn(`[${ts()}] [${userId}] ✗ número sem WhatsApp: ${number}`)
           reject(new Error(`Número ${number} não possui WhatsApp.`));
           continue;
         }
@@ -656,10 +716,13 @@ async function processQueue(userId: string) {
         const sentMessage = await session.client.sendMessage(chatId, sendPayload, sendOptions);
         session.sentMessages += 1;
 
+        const ms = Date.now() - t0
         const logType = currentItem.media?.ptt ? 'ptt' : currentItem.media ? 'image' : 'chat'
         const logBody = currentItem.media?.ptt
           ? `[voz: ${currentItem.media.filename}]`
           : currentItem.media ? `[imagem: ${currentItem.media.filename}]` : message
+
+        console.log(`[${ts()}] [${userId}] ✓ ${type} enviado para ${number} em ${ms}ms | total enviadas: ${session.sentMessages}`)
 
         cappedMapSet(messageRegistry, messageId, {
           userId,
@@ -694,12 +757,14 @@ async function processQueue(userId: string) {
           whatsappMessageId: sentMessage.id._serialized
         });
       } catch (err: any) {
-        console.error(`[${userId}] Erro ao enviar mensagem para ${number}:`, err);
+        const ms = Date.now() - t0
+        console.error(`[${ts()}] [${userId}] ✗ falha ${type} para ${number} em ${ms}ms:`, err.message);
         reject(new Error(`Falha ao enviar mensagem para ${number}: ${err.message}`));
       }
     }
   } finally {
     isSendingMessage.set(userId, false);
+    console.log(`[${ts()}] [${userId}] Fila finalizada`)
   }
 }
 
@@ -721,6 +786,8 @@ app.post('/message/send-text/:userId', async (req: Request, res: Response) => {
   const session = activeClients.get(userId);
   if (!session) return res.status(404).send('Sessão não encontrada.');
   session.apiCalls++;
+
+  console.log(`[${ts()}] [${userId}] /send-text → ${number} | fila atual: ${messageQueues.get(userId)?.length ?? 0}`)
 
   await syncSessionReadiness(session)
   if (!session.ready) return res.status(400).send('Instância não pronta.');
@@ -750,7 +817,7 @@ app.post('/message/send-text/:userId', async (req: Request, res: Response) => {
       instanceId: session.instanceId
     });
   } catch (err: any) {
-    console.error('Erro no envio de mensagem:', err);
+    console.error(`[${ts()}] [${userId}] /send-text falhou para ${number}:`, err.message);
     const errorMessage = err instanceof Error ? err.message : String(err)
     res.status(500).json({
       error: 'Erro ao enviar mensagem.',
@@ -804,6 +871,7 @@ app.post('/message/send-image/:userId', async (req: Request, res: Response) => {
   }
 
   session.apiCalls++
+  console.log(`[${ts()}] [${userId}] /send-image → ${number} | ${req.file.originalname ?? 'sem nome'} (${(req.file.size / 1024).toFixed(1)} KB, ${req.file.mimetype}) | fila atual: ${messageQueues.get(userId)?.length ?? 0}`)
 
   await syncSessionReadiness(session)
   if (!session.ready) return res.status(400).send('Instância não pronta.')
@@ -839,7 +907,7 @@ app.post('/message/send-image/:userId', async (req: Request, res: Response) => {
     ])
     res.json({ ...result, userId, instanceId: session.instanceId })
   } catch (err: any) {
-    console.error(`[${userId}] Erro ao enviar imagem para ${number}:`, err)
+    console.error(`[${ts()}] [${userId}] /send-image falhou para ${number}:`, err.message)
     const errorMessage = err instanceof Error ? err.message : String(err)
     res.status(500).json({
       error: 'Erro ao enviar imagem.',
@@ -891,6 +959,7 @@ app.post('/message/send-audio/:userId', async (req: Request, res: Response) => {
   }
 
   session.apiCalls++
+  console.log(`[${ts()}] [${userId}] /send-audio → ${number} | ${req.file.originalname ?? 'sem nome'} (${(req.file.size / 1024).toFixed(1)} KB, ${req.file.mimetype}) | fila atual: ${messageQueues.get(userId)?.length ?? 0}`)
 
   await syncSessionReadiness(session)
   if (!session.ready) return res.status(400).send('Instância não pronta.')
@@ -925,7 +994,7 @@ app.post('/message/send-audio/:userId', async (req: Request, res: Response) => {
     ])
     res.json({ ...result, userId, instanceId: session.instanceId })
   } catch (err: any) {
-    console.error(`[${userId}] Erro ao enviar áudio para ${number}:`, err)
+    console.error(`[${ts()}] [${userId}] /send-audio falhou para ${number}:`, err.message)
     const errorMessage = err instanceof Error ? err.message : String(err)
     res.status(500).json({
       error: 'Erro ao enviar áudio.',
@@ -948,6 +1017,8 @@ app.post('/ia/pause/:userId', (req: Request, res: Response) => {
 
   if (!pausedNumbers.has(userId)) pausedNumbers.set(userId, new Set());
   pausedNumbers.get(userId)!.add(number);
+
+  console.log(`[${ts()}] [${userId}] IA pausada para ${number}`)
 
   res.json({
     message: `Atendimento da IA pausado para ${number} em ${userId}`,
@@ -993,7 +1064,7 @@ app.get('/message/media/:userId/:whatsappMessageId', async (req: Request, res: R
       filename: messageData._data?.filename || null
     });
   } catch (err: any) {
-    console.error(`[${userId}] Erro ao obter mídia:`, err);
+    console.error(`[${ts()}] [${userId}] Erro ao obter mídia:`, err);
     res.status(500).send(`Erro ao obter mídia: ${err?.message}`);
   }
 });
@@ -1022,6 +1093,8 @@ app.post('/ia/resume/:userId', (req: Request, res: Response) => {
   session.apiCalls++;
 
   pausedNumbers.get(userId)?.delete(number);
+
+  console.log(`[${ts()}] [${userId}] IA retomada para ${number}`)
 
   res.json({
     message: `Atendimento da IA retomado para ${number} em ${userId}`,
@@ -1122,22 +1195,22 @@ app.get('/', (_req: Request, res: Response) => {
 // (ex: "Execution context was destroyed") derrubem o servidor inteiro.
 // O processo permanece vivo; a sessão afetada fica com ready=false e pode ser reiniciada via API.
 process.on('uncaughtException', (err: Error) => {
-  console.error('[PROCESSO] Exceção não capturada — servidor mantido vivo:', err.message)
+  console.error(`[${ts()}] [PROCESSO] Exceção não capturada — servidor mantido vivo:`, err.message)
 })
 
 process.on('unhandledRejection', (reason: unknown) => {
   const msg = reason instanceof Error ? reason.message : String(reason)
-  console.error('[PROCESSO] Rejeição não tratada — servidor mantido vivo:', msg)
+  console.error(`[${ts()}] [PROCESSO] Rejeição não tratada — servidor mantido vivo:`, msg)
 })
 
 // Graceful shutdown — encerra todos os processos Chromium antes de sair,
 // evitando processos órfãos que acumulam RAM/CPU entre deploys no Docker.
 async function gracefulShutdown(signal: string) {
-  console.log(`[SHUTDOWN] Sinal ${signal} recebido. Encerrando ${activeClients.size} sessão(ões)...`)
+  console.log(`[${ts()}] [SHUTDOWN] Sinal ${signal} recebido. Encerrando ${activeClients.size} sessão(ões)...`)
   for (const [userId, session] of activeClients.entries()) {
     try {
       await session.client.destroy()
-      console.log(`[SHUTDOWN] Sessão ${userId} encerrada.`)
+      console.log(`[${ts()}] [SHUTDOWN] Sessão ${userId} encerrada`)
     } catch {
       // ignora — processo vai encerrar de qualquer forma
     }
@@ -1149,4 +1222,10 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
 process.on('SIGINT',  () => gracefulShutdown('SIGINT'))
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Backend multi-sessão com IDs únicos rodando na porta ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`[${ts()}] [STARTUP] Backend WhatsApp rodando na porta ${PORT}`)
+  console.log(`[${ts()}] [STARTUP] API_KEY:         ${API_KEY ? 'configurada ✓' : 'NÃO CONFIGURADA ⚠'}`)
+  console.log(`[${ts()}] [STARTUP] WEBHOOK_URL:     ${process.env.WEBHOOK_URL || 'não configurada'}`)
+  console.log(`[${ts()}] [STARTUP] WEBHOOK_SECRET:  ${process.env.WEBHOOK_SECRET ? 'configurado ✓' : 'não configurado'}`)
+  console.log(`[${ts()}] [STARTUP] SENDERWHATS_URL: ${process.env.SENDERWHATS_URL || 'não configurada'}`)
+})
