@@ -59,7 +59,7 @@ type QueueItem = {
   number: string
   message: string
   messageId: string
-  media?: { base64: string; mimetype: string; filename: string }
+  media?: { base64: string; mimetype: string; filename: string; ptt?: boolean }
   resolve: (value: SendResult) => void
   reject: (reason?: unknown) => void
 }
@@ -106,6 +106,10 @@ const SEND_TIMEOUT_MS = 60_000     // 60s — cobre texto e imagem na mesma fila
 const ALLOWED_IMAGE_MIMETYPES = new Set([
   'image/jpeg', 'image/png', 'image/gif', 'image/webp'
 ])
+const ALLOWED_AUDIO_MIMETYPES = new Set([
+  'audio/ogg', 'audio/mpeg', 'audio/mp3', 'audio/mp4',
+  'audio/wav', 'audio/wave', 'audio/x-wav', 'audio/aac', 'audio/webm'
+])
 
 const upload = multer({
   storage: multer.memoryStorage(), // arquivo em RAM — sem disco, ideal para containers
@@ -115,6 +119,20 @@ const upload = multer({
       cb(null, true)
     } else {
       cb(new Error(`Tipo não suportado: ${file.mimetype}. Use JPEG, PNG, GIF ou WebP.`))
+    }
+  }
+})
+
+const uploadAudio = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: WHATSAPP_MEDIA_LIMIT_MB * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    // Normaliza antes de checar — browsers enviam "audio/ogg; codecs=opus", "audio/webm; codecs=opus", etc.
+    const baseMime = file.mimetype.split(';')[0].trim()
+    if (ALLOWED_AUDIO_MIMETYPES.has(baseMime)) {
+      cb(null, true)
+    } else {
+      cb(new Error(`Tipo não suportado: ${file.mimetype}. Use OGG, MP3, WAV, MP4 ou AAC.`))
     }
   }
 })
@@ -280,6 +298,36 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
       console.warn(`[${userId}] Rejeitando ${pending.length} mensagens pendentes na fila por desconexão.`)
       for (const item of pending) {
         item.reject(new Error('Sessão desconectada. Tente novamente.'))
+      }
+    }
+  })
+
+  client.on('message_ack', async (msg: any, ack: number) => {
+    if (ack < 2) return // ack 1 (servidor WA recebeu) já é setado pelo SenderWhats no disparo
+
+    const senderwhatsUrl = process.env.SENDERWHATS_URL
+    if (!senderwhatsUrl) return
+
+    const messageId = msg.id._serialized
+    const webhookSecret = process.env.WEBHOOK_SECRET
+
+    try {
+      const res = await fetch(`${senderwhatsUrl}/api/webhooks/message-ack`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(webhookSecret ? { 'x-webhook-secret': webhookSecret } : {}),
+        },
+        body: JSON.stringify({ messageId, ack, userId }),
+        signal: AbortSignal.timeout(8000),
+      })
+
+      if (!res.ok) {
+        console.warn(`[${userId}] ack-webhook retornou ${res.status} para msg ${messageId}`)
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name !== 'TimeoutError' && err.name !== 'AbortError') {
+        console.error(`[${userId}] ack-webhook erro inesperado para ${messageId}:`, err.message)
       }
     }
   })
@@ -592,9 +640,17 @@ async function processQueue(userId: string) {
             )
           : message
 
+        const sendOptions: Record<string, unknown> = { sendSeen: false }
+        if (currentItem.media?.ptt) sendOptions.sendAudioAsVoice = true
+
         // sendSeen: false evita o crash interno de 'markedUnread' no WhatsApp Web
-        const sentMessage = await session.client.sendMessage(chatId, sendPayload, { sendSeen: false });
+        const sentMessage = await session.client.sendMessage(chatId, sendPayload, sendOptions);
         session.sentMessages += 1;
+
+        const logType = currentItem.media?.ptt ? 'ptt' : currentItem.media ? 'image' : 'chat'
+        const logBody = currentItem.media?.ptt
+          ? `[voz: ${currentItem.media.filename}]`
+          : currentItem.media ? `[imagem: ${currentItem.media.filename}]` : message
 
         cappedMapSet(messageRegistry, messageId, {
           userId,
@@ -611,8 +667,8 @@ async function processQueue(userId: string) {
           instanceId: session.instanceId,
           number,
           name: number,
-          body: currentItem.media ? `[imagem: ${currentItem.media.filename}]` : message,
-          type: currentItem.media ? 'image' : 'chat',
+          body: logBody,
+          type: logType,
           direction: 'sent',
           timestamp: new Date(),
           media: currentItem.media
@@ -625,7 +681,7 @@ async function processQueue(userId: string) {
         resolve({
           success: true,
           messageId,
-          message: currentItem.media ? 'Imagem enviada!' : 'Mensagem enviada!',
+          message: currentItem.media?.ptt ? 'Áudio enviado!' : currentItem.media ? 'Imagem enviada!' : 'Mensagem enviada!',
           whatsappMessageId: sentMessage.id._serialized
         });
       } catch (err: any) {
@@ -778,6 +834,92 @@ app.post('/message/send-image/:userId', async (req: Request, res: Response) => {
     const errorMessage = err instanceof Error ? err.message : String(err)
     res.status(500).json({
       error: 'Erro ao enviar imagem.',
+      details: errorMessage,
+      userId,
+      instanceId: session.instanceId
+    })
+  }
+})
+
+app.post('/message/send-audio/:userId', async (req: Request, res: Response) => {
+  const userId = getParam(req.params.userId)
+
+  const session = activeClients.get(userId)
+  if (!session) return res.status(404).send('Sessão não encontrada.')
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      uploadAudio.single('audio')(req, res, (err: unknown) => (err ? reject(err) : resolve()))
+    })
+  } catch (err: any) {
+    const isSizeError = err?.code === 'LIMIT_FILE_SIZE'
+    return res.status(400).json({
+      ok: false,
+      error: 'invalid_file',
+      details: isSizeError
+        ? `Arquivo muito grande. Máximo ${WHATSAPP_MEDIA_LIMIT_MB}MB.`
+        : err.message ?? 'Arquivo inválido.'
+    })
+  }
+
+  const number = String(req.body.number ?? '').trim()
+
+  if (!number) {
+    return res.status(400).json({
+      ok: false,
+      error: 'invalid_payload',
+      details: "Campo 'number' é obrigatório.",
+      example: { number: '5511999999999' }
+    })
+  }
+
+  if (!req.file) {
+    return res.status(400).json({
+      ok: false,
+      error: 'invalid_payload',
+      details: "Campo 'audio' (arquivo) é obrigatório."
+    })
+  }
+
+  session.apiCalls++
+
+  await syncSessionReadiness(session)
+  if (!session.ready) return res.status(400).send('Instância não pronta.')
+
+  if (!messageQueues.has(userId)) messageQueues.set(userId, [])
+
+  const messageId = generateUniqueId()
+  const base64 = req.file.buffer.toString('base64')
+  const ext = (req.file.mimetype.split('/')[1]?.split(';')[0] ?? 'ogg').replace('mpeg', 'mp3')
+  const safeName = (req.file.originalname ?? '').trim().replace(/[/\\]/g, '').replace(/\.\./g, '').trim()
+  const filename = safeName || `audio-${Date.now()}.${ext}`
+
+  const sendPromise = new Promise<SendResult>((resolve, reject) => {
+    messageQueues.get(userId)!.push({
+      number,
+      message: '',
+      messageId,
+      media: { base64, mimetype: req.file!.mimetype, filename, ptt: true },
+      resolve,
+      reject
+    })
+  })
+
+  processQueue(userId)
+
+  try {
+    const result = await Promise.race([
+      sendPromise,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Tempo limite excedido. Tente novamente.')), SEND_TIMEOUT_MS)
+      )
+    ])
+    res.json({ ...result, userId, instanceId: session.instanceId })
+  } catch (err: any) {
+    console.error(`[${userId}] Erro ao enviar áudio para ${number}:`, err)
+    const errorMessage = err instanceof Error ? err.message : String(err)
+    res.status(500).json({
+      error: 'Erro ao enviar áudio.',
       details: errorMessage,
       userId,
       instanceId: session.instanceId
