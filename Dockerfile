@@ -11,10 +11,18 @@ WORKDIR /app
 
 COPY package*.json ./
 
+# Instala todas as dependências (incluindo devDependencies para compilar)
 RUN npm install
 
 COPY . .
 
+# Compila TypeScript → JavaScript em /app/dist
+RUN npm run build
+
+# Remove devDependencies após o build — ts-node, typescript e @types/* saem da memória
+RUN npm prune --production
+
 EXPOSE 3000
 
-CMD ["npm", "start"]
+# Roda o JS compilado com node puro — sem overhead do compilador TypeScript (~1.8 GB → ~200-300 MB)
+CMD ["node", "dist/index.js"]
