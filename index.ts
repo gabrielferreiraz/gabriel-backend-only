@@ -223,13 +223,18 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: userId, dataPath: '/app/sessions' }),
     puppeteer: {
+      executablePath: '/usr/bin/chromium',
       headless: true,
       args: [
-        '--no-sandbox', '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage', '--disable-gpu',
-        '--no-zygote', '--disable-extensions', '--no-first-run',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--single-process',
       ],
-      executablePath: require('puppeteer').executablePath(),
     },
   })
 
@@ -679,7 +684,7 @@ async function processQueue(userId: string) {
 
 // ─── Helpers compartilhados dos endpoints de envio ────────────────────────────
 
-function checkSendPreconditions(session: SessionData, userId: string, res: Response): boolean {
+function checkSendPreconditions(session: SessionData, _userId: string, res: Response): boolean {
   if (!session.ready) {
     res.status(400).send('Instância não pronta.')
     return false
