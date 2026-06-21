@@ -4,7 +4,8 @@ import cors from "cors"
 import qrcode from "qrcode"
 import multer from "multer"
 import * as nodeCrypto from "node:crypto"
-import { mkdirSync } from "fs"
+import { mkdirSync, rmSync } from "fs"
+import { join } from "path"
 
 // Garante que o diretório de sessões existe antes de qualquer inicialização.
 // Monte como volume no EasyPanel: /app/sessions → volume persistente
@@ -472,6 +473,13 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
       console.error(`[${ts()}] [${userId}] [MSG] Erro ao processar mensagem recebida:`, err?.message ?? err)
     }
   })
+
+  // Remove lock files deixados pelo container anterior — sem isso o Chrome recusa iniciar
+  // porque vê o SingletonLock de um "outro processo" (container com hostname diferente)
+  const chromeProfileDir = join('/app/sessions', '.wwebjs_auth', `session-${userId}`)
+  for (const lock of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    try { rmSync(join(chromeProfileDir, lock), { force: true }) } catch {}
+  }
 
   client.initialize()
   activeClients.set(userId, sessionData)
