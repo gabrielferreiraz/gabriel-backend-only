@@ -4,8 +4,9 @@ import cors from "cors"
 import qrcode from "qrcode"
 import multer from "multer"
 import * as nodeCrypto from "node:crypto"
-import { mkdirSync, rmSync } from "fs"
-import { join } from "path"
+import { mkdirSync, existsSync, readdirSync } from "fs"
+import { spawnSync } from "child_process"
+import { hostname } from "os"
 
 // Garante que o diretório de sessões existe antes de qualquer inicialização.
 // Monte como volume no EasyPanel: /app/sessions → volume persistente
@@ -474,16 +475,39 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
     }
   })
 
-  // Remove lock files deixados pelo container anterior — sem isso o Chrome recusa iniciar
-  // porque vê o SingletonLock de um "outro processo" (container com hostname diferente)
-  const chromeProfileDir = join('/app/sessions', '.wwebjs_auth', `session-${userId}`)
-  for (const lock of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
-    try { rmSync(join(chromeProfileDir, lock), { force: true }) } catch {}
+  // Diagnóstico: estado do diretório de sessão antes do cleanup
+  const sessionDir = `/app/sessions/.wwebjs_auth/session-${userId}`
+  if (existsSync(sessionDir)) {
+    try {
+      const all = readdirSync(sessionDir)
+      const locks = all.filter(f => f.startsWith('Singleton'))
+      console.log(`[${ts()}] [${userId}] Sessão anterior encontrada: ${all.length} arquivo(s) | locks: ${locks.length ? locks.join(', ') : 'nenhum'}`)
+    } catch (e: any) {
+      console.log(`[${ts()}] [${userId}] Sessão anterior existe mas não pôde ser lida: ${e.message}`)
+    }
+  } else {
+    console.log(`[${ts()}] [${userId}] Primeira criação — sem sessão anterior em ${sessionDir}`)
   }
 
+  // Remove lock files do Chromium deixados por containers anteriores.
+  // Usa `find` recursivo para não depender do caminho exato que o whatsapp-web.js usa.
+  // Sem isso o Chrome recusa iniciar porque o SingletonLock contém o hostname do container antigo.
+  try {
+    const r = spawnSync('find', ['/app/sessions', '-name', 'Singleton*', '-delete', '-print'], { encoding: 'utf8' })
+    if (r.stdout?.trim()) {
+      console.log(`[${ts()}] [${userId}] Chromium locks removidos: ${r.stdout.trim().replace(/\n/g, ', ')}`)
+    } else {
+      console.log(`[${ts()}] [${userId}] Chromium: nenhum lock encontrado em /app/sessions`)
+    }
+    if (r.stderr?.trim()) {
+      console.warn(`[${ts()}] [${userId}] find stderr: ${r.stderr.trim()}`)
+    }
+  } catch {}
+
+  console.log(`[${ts()}] [${userId}] Lançando Chromium em /usr/bin/chromium...`)
   client.initialize()
   activeClients.set(userId, sessionData)
-  console.log(`[${ts()}] [${userId}] Cliente inicializado — aguardando QR ou autenticação automática`)
+  console.log(`[${ts()}] [${userId}] client.initialize() chamado — aguardando QR ou autenticação automática`)
 
   res.status(200).json({ message: `Instância '${userId}' criada com sucesso.`, userId, instanceId })
 })
@@ -1004,9 +1028,18 @@ process.on('SIGINT',  () => gracefulShutdown('SIGINT'))
 const PORT = process.env.PORT || 8080
 app.listen(PORT, () => {
   console.log(`[${ts()}] [STARTUP] Backend WhatsApp rodando na porta ${PORT}`)
+  console.log(`[${ts()}] [STARTUP] Hostname:        ${hostname()}`)
   console.log(`[${ts()}] [STARTUP] Sessões em:      /app/sessions`)
   console.log(`[${ts()}] [STARTUP] API_KEY:         ${API_KEY ? 'configurada ✓' : 'NÃO CONFIGURADA ⚠'}`)
   console.log(`[${ts()}] [STARTUP] WEBHOOK_URL:     ${process.env.WEBHOOK_URL || 'não configurada'}`)
   console.log(`[${ts()}] [STARTUP] WEBHOOK_SECRET:  ${process.env.WEBHOOK_SECRET ? 'configurado ✓' : 'não configurado'}`)
   console.log(`[${ts()}] [STARTUP] SENDERWHATS_URL: ${process.env.SENDERWHATS_URL || 'não configurada'}`)
+
+  const chromiumPath = '/usr/bin/chromium'
+  if (existsSync(chromiumPath)) {
+    const ver = spawnSync(chromiumPath, ['--version'], { encoding: 'utf8' })
+    console.log(`[${ts()}] [STARTUP] Chromium:        ${ver.stdout?.trim() || 'encontrado (versão indisponível)'}`)
+  } else {
+    console.error(`[${ts()}] [STARTUP] Chromium:        NÃO ENCONTRADO em ${chromiumPath} — instâncias falharão ao iniciar`)
+  }
 })
