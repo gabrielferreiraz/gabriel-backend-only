@@ -4,7 +4,7 @@ import cors from "cors"
 import qrcode from "qrcode"
 import multer from "multer"
 import * as nodeCrypto from "node:crypto"
-import { mkdirSync, existsSync, readdirSync } from "fs"
+import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync } from "fs"
 import { spawnSync } from "child_process"
 import { hostname } from "os"
 
@@ -138,6 +138,33 @@ const IGNORED_WEBHOOK_TYPES = new Set([
   'notification_template', 'notification', 'e2e_notification', 'call_log', 'protocol',
 ])
 
+// ─── Persistência de sessões ──────────────────────────────────────────────────
+const SESSIONS_FILE = '/app/sessions/sessions.json'
+
+function loadPersistedSessions(): string[] {
+  try {
+    if (!existsSync(SESSIONS_FILE)) return []
+    return JSON.parse(readFileSync(SESSIONS_FILE, 'utf8'))
+  } catch { return [] }
+}
+
+function savePersistedSessions(userIds: string[]): void {
+  try {
+    writeFileSync(SESSIONS_FILE, JSON.stringify(userIds), 'utf8')
+  } catch (e: any) {
+    console.error(`[${ts()}] [PERSIST] Erro ao salvar sessions.json:`, e?.message)
+  }
+}
+
+function addPersistedSession(userId: string): void {
+  const list = loadPersistedSessions()
+  if (!list.includes(userId)) savePersistedSessions([...list, userId])
+}
+
+function removePersistedSession(userId: string): void {
+  savePersistedSessions(loadPersistedSessions().filter(s => s !== userId))
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: WHATSAPP_MEDIA_LIMIT_MB * 1024 * 1024 },
@@ -202,22 +229,8 @@ async function syncSessionReadiness(session: SessionData): Promise<string | null
 
 // ─── /instance/create ────────────────────────────────────────────────────────
 
-app.get('/instance/create/:userId', (req: Request, res: Response) => {
-  const userId = getParam(req.params.userId)
-
-  if (activeClients.has(userId)) {
-    const existing = activeClients.get(userId)!
-    console.log(`[${ts()}] [${userId}] Sessão já existe — ready=${existing.ready} state=${existing.lastKnownState ?? '?'}`)
-    return res.status(200).json({
-      message: 'Sessão já existe',
-      status: 'existing',
-      userId,
-      instanceId: existing.instanceId,
-      ready: existing.ready,
-      authenticated: existing.authenticated,
-      state: existing.lastKnownState,
-    })
-  }
+function createSession(userId: string): void {
+  if (activeClients.has(userId)) return
 
   const instanceId = generateUniqueId()
   console.log(`[${ts()}] [${userId}] Criando nova sessão (instanceId: ${instanceId})...`)
@@ -533,9 +546,30 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
   console.log(`[${ts()}] [${userId}] Lançando Chromium em /usr/bin/chromium...`)
   client.initialize()
   activeClients.set(userId, sessionData)
+  addPersistedSession(userId)
   console.log(`[${ts()}] [${userId}] client.initialize() chamado — aguardando QR ou autenticação automática`)
+}
 
-  res.status(200).json({ message: `Instância '${userId}' criada com sucesso.`, userId, instanceId })
+app.get('/instance/create/:userId', (req: Request, res: Response) => {
+  const userId = getParam(req.params.userId)
+
+  if (activeClients.has(userId)) {
+    const existing = activeClients.get(userId)!
+    console.log(`[${ts()}] [${userId}] Sessão já existe — ready=${existing.ready} state=${existing.lastKnownState ?? '?'}`)
+    return res.status(200).json({
+      message: 'Sessão já existe',
+      status: 'existing',
+      userId,
+      instanceId: existing.instanceId,
+      ready: existing.ready,
+      authenticated: existing.authenticated,
+      state: existing.lastKnownState,
+    })
+  }
+
+  createSession(userId)
+  const session = activeClients.get(userId)!
+  res.status(200).json({ message: `Instância '${userId}' criada com sucesso.`, userId, instanceId: session.instanceId })
 })
 
 // ─── Logs / consultas ─────────────────────────────────────────────────────────
@@ -656,6 +690,7 @@ app.post('/instance/disconnect/:userId', async (req: Request, res: Response) => 
   pausedNumbers.delete(userId)
   messageQueues.delete(userId)
   isSendingMessage.delete(userId)
+  removePersistedSession(userId)
 
   console.log(`[${ts()}] [${userId}] [DISCONNECT] Sessão removida — enviadas: ${session.sentMessages} | recebidas: ${session.receivedMessages} | chamadas API: ${session.apiCalls}`)
   res.json({ message: `Sessão ${userId} desconectada.`, userId, instanceId: session.instanceId })
@@ -1067,5 +1102,20 @@ app.listen(PORT, () => {
     console.log(`[${ts()}] [STARTUP] Chromium:        ${ver.stdout?.trim() || 'encontrado (versão indisponível)'}`)
   } else {
     console.error(`[${ts()}] [STARTUP] Chromium:        NÃO ENCONTRADO em ${chromiumPath} — instâncias falharão ao iniciar`)
+  }
+
+  // Recupera sessões que estavam ativas antes do restart
+  const toRecover = loadPersistedSessions()
+  if (toRecover.length === 0) {
+    console.log(`[${ts()}] [STARTUP] Nenhuma sessão persistida para recuperar`)
+  } else {
+    console.log(`[${ts()}] [STARTUP] Recuperando ${toRecover.length} sessão(ões): ${toRecover.join(', ')}`)
+    toRecover.forEach((uid, index) => {
+      // Escalonar 5s entre cada sessão para não estourar RAM no boot
+      setTimeout(() => {
+        console.log(`[${ts()}] [STARTUP] Iniciando recuperação de: ${uid}`)
+        createSession(uid)
+      }, index * 5_000)
+    })
   }
 })
