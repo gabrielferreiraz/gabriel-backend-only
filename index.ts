@@ -431,6 +431,8 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
 
   client.on('message', async (msg: any) => {
     try {
+      if (msg.from.endsWith('@g.us') || msg.from.endsWith('@newsletter') || IGNORED_WEBHOOK_TYPES.has(msg.type)) return
+
       sessionData.receivedMessages++
       const contact = await msg.getContact().catch(() => null)
       const contactName = contact?.pushname || contact?.name || contact?.number || msg.from
@@ -474,7 +476,7 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
       }
 
       const webhookUrl = process.env.WEBHOOK_URL
-      if (webhookUrl && !msg.fromMe && !msg.from.endsWith('@g.us') && !IGNORED_WEBHOOK_TYPES.has(msg.type)) {
+      if (webhookUrl && !msg.fromMe) {
         const controller = new AbortController()
         const timer = setTimeout(() => controller.abort(), 5000)
         const t0 = Date.now()
