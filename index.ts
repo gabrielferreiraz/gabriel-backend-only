@@ -249,13 +249,12 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
         '--disable-translate',
         '--hide-scrollbars',
         '--mute-audio',
-        '--disable-background-networking',
         '--disable-background-timer-throttling',
         '--disable-renderer-backgrounding',
         '--disable-client-side-phishing-detection',
         '--disable-hang-monitor',
         '--disable-prompt-on-repost',
-        '--disable-features=TranslateUI,Translate,BlinkGenPropertyTrees',
+        '--disable-features=TranslateUI,Translate',
         '--disable-ipc-flooding-protection',
 
         // Cache mínimo (reduz uso de disco e memória mapeada)
