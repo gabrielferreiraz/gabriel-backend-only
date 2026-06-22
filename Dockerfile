@@ -25,4 +25,4 @@ RUN npm prune --production
 EXPOSE 3000
 
 # Roda o JS compilado com node puro — sem overhead do compilador TypeScript (~1.8 GB → ~200-300 MB)
-CMD ["node", "dist/index.js"]
+CMD ["node", "--max-old-space-size=256", "dist/index.js"]

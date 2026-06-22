@@ -124,7 +124,7 @@ const isSendingMessage = new Map<string, boolean>()
 const messageRegistry  = new Map<string, RegistryPayload>()
 
 const MAX_REGISTRY_SIZE      = 5000
-const MAX_SESSION_LOGS       = 1000
+const MAX_SESSION_LOGS       = 200
 const WHATSAPP_MEDIA_LIMIT_MB = 16
 const SEND_TIMEOUT_MS        = 60_000
 const READY_WARMUP_MS        = 5_000  // warm-up após ready antes de aceitar envios
@@ -228,14 +228,39 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
       executablePath: '/usr/bin/chromium',
       headless: true,
       args: [
+        // Segurança / Docker obrigatório
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
         '--no-first-run',
         '--no-zygote',
-        '--disable-gpu',
         '--single-process',
+
+        // GPU / renderização (não usados em headless)
+        '--disable-gpu',
+        '--disable-accelerated-2d-canvas',
+        '--disable-software-rasterizer',
+
+        // Subsistemas desnecessários para WhatsApp Web
+        '--disable-extensions',
+        '--disable-component-extensions-with-background-pages',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--disable-translate',
+        '--hide-scrollbars',
+        '--mute-audio',
+        '--disable-background-networking',
+        '--disable-background-timer-throttling',
+        '--disable-renderer-backgrounding',
+        '--disable-client-side-phishing-detection',
+        '--disable-hang-monitor',
+        '--disable-prompt-on-repost',
+        '--disable-features=TranslateUI,Translate,BlinkGenPropertyTrees',
+        '--disable-ipc-flooding-protection',
+
+        // Cache mínimo (reduz uso de disco e memória mapeada)
+        '--disk-cache-size=1',
+        '--media-cache-size=1',
       ],
     },
   })
