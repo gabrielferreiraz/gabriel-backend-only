@@ -1,16 +1,75 @@
 import express, { type Request, type Response, type NextFunction } from "express"
-import { Client, LocalAuth, MessageMedia } from "whatsapp-web.js"
+import { Client, RemoteAuth, MessageMedia } from "whatsapp-web.js"
 import cors from "cors"
 import qrcode from "qrcode"
 import multer from "multer"
 import * as nodeCrypto from "node:crypto"
-import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync } from "fs"
+import { existsSync, readFileSync, writeFileSync, rmSync } from "fs"
 import { spawnSync } from "child_process"
 import { hostname } from "os"
+import { join } from "path"
+import { Pool } from "pg"
 
-// Garante que o diretório de sessões existe antes de qualquer inicialização.
-// Monte como volume no EasyPanel: /app/sessions → volume persistente
-mkdirSync('/app/sessions', { recursive: true })
+// ─── PostgreSQL ───────────────────────────────────────────────────────────────
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL })
+
+async function initDatabase(): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS whatsapp_sessions (
+      session_id   VARCHAR(255) PRIMARY KEY,
+      session_data TEXT         NOT NULL,
+      updated_at   TIMESTAMP    NOT NULL DEFAULT NOW()
+    )
+  `)
+  console.log(`[${ts()}] [DB] Tabela whatsapp_sessions verificada/criada`)
+}
+
+// Store implementando a interface do RemoteAuth
+class PostgreSQLStore {
+  async sessionExists({ session }: { session: string }): Promise<boolean> {
+    const { rows } = await pool.query(
+      'SELECT 1 FROM whatsapp_sessions WHERE session_id = $1',
+      [session]
+    )
+    return rows.length > 0
+  }
+
+  async save({ session }: { session: string }): Promise<void> {
+    const zipPath = join(process.cwd(), `${session}.zip`)
+    const data = readFileSync(zipPath).toString('base64')
+    await pool.query(`
+      INSERT INTO whatsapp_sessions (session_id, session_data, updated_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (session_id) DO UPDATE
+        SET session_data = EXCLUDED.session_data, updated_at = NOW()
+    `, [session, data])
+  }
+
+  async extract({ session, path: targetPath }: { session: string; path: string }): Promise<void> {
+    const { rows } = await pool.query(
+      'SELECT session_data FROM whatsapp_sessions WHERE session_id = $1',
+      [session]
+    )
+    if (rows.length === 0) return
+    writeFileSync(join(targetPath, `${session}.zip`), Buffer.from(rows[0].session_data, 'base64'))
+  }
+
+  async delete({ session }: { session: string }): Promise<void> {
+    await pool.query('DELETE FROM whatsapp_sessions WHERE session_id = $1', [session])
+  }
+}
+
+async function loadPersistedSessions(): Promise<string[]> {
+  try {
+    const { rows } = await pool.query('SELECT session_id FROM whatsapp_sessions')
+    // session_id é 'RemoteAuth-gabriel_ferreira' → extrai só o userId
+    return rows.map((r: { session_id: string }) => r.session_id.replace(/^RemoteAuth-/, ''))
+  } catch (e: any) {
+    console.error(`[${ts()}] [DB] Erro ao carregar sessões persistidas:`, e?.message)
+    return []
+  }
+}
 
 const app = express()
 app.use(cors())
@@ -138,32 +197,6 @@ const IGNORED_WEBHOOK_TYPES = new Set([
   'notification_template', 'notification', 'e2e_notification', 'call_log', 'protocol',
 ])
 
-// ─── Persistência de sessões ──────────────────────────────────────────────────
-const SESSIONS_FILE = '/app/sessions/sessions.json'
-
-function loadPersistedSessions(): string[] {
-  try {
-    if (!existsSync(SESSIONS_FILE)) return []
-    return JSON.parse(readFileSync(SESSIONS_FILE, 'utf8'))
-  } catch { return [] }
-}
-
-function savePersistedSessions(userIds: string[]): void {
-  try {
-    writeFileSync(SESSIONS_FILE, JSON.stringify(userIds), 'utf8')
-  } catch (e: any) {
-    console.error(`[${ts()}] [PERSIST] Erro ao salvar sessions.json:`, e?.message)
-  }
-}
-
-function addPersistedSession(userId: string): void {
-  const list = loadPersistedSessions()
-  if (!list.includes(userId)) savePersistedSessions([...list, userId])
-}
-
-function removePersistedSession(userId: string): void {
-  savePersistedSessions(loadPersistedSessions().filter(s => s !== userId))
-}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -236,7 +269,12 @@ function createSession(userId: string): void {
   console.log(`[${ts()}] [${userId}] Criando nova sessão (instanceId: ${instanceId})...`)
 
   const client = new Client({
-    authStrategy: new LocalAuth({ clientId: userId, dataPath: '/app/sessions' }),
+    authStrategy: new RemoteAuth({
+      clientId: userId,
+      dataPath: '/tmp/wwebjs',
+      store: new PostgreSQLStore(),
+      backupSyncIntervalMs: 300_000,
+    }),
     puppeteer: {
       executablePath: '/usr/bin/chromium',
       headless: true,
@@ -310,7 +348,7 @@ function createSession(userId: string): void {
   client.on('ready', () => {
     readyCount++
 
-    if (readyCount > 2) {
+    if (readyCount > 5) {
       if (!destroyingDueToLoop) {
         destroyingDueToLoop = true
         console.error(`[${ts()}] [${userId}] [LOOP] Loop de inicialização detectado (ready #${readyCount}) — encerrando sessão para proteger o número`)
@@ -514,39 +552,9 @@ function createSession(userId: string): void {
     }
   })
 
-  // Diagnóstico: estado do diretório de sessão antes do cleanup
-  const sessionDir = `/app/sessions/.wwebjs_auth/session-${userId}`
-  if (existsSync(sessionDir)) {
-    try {
-      const all = readdirSync(sessionDir)
-      const locks = all.filter(f => f.startsWith('Singleton'))
-      console.log(`[${ts()}] [${userId}] Sessão anterior encontrada: ${all.length} arquivo(s) | locks: ${locks.length ? locks.join(', ') : 'nenhum'}`)
-    } catch (e: any) {
-      console.log(`[${ts()}] [${userId}] Sessão anterior existe mas não pôde ser lida: ${e.message}`)
-    }
-  } else {
-    console.log(`[${ts()}] [${userId}] Primeira criação — sem sessão anterior em ${sessionDir}`)
-  }
-
-  // Remove lock files do Chromium deixados por containers anteriores.
-  // Usa `find` recursivo para não depender do caminho exato que o whatsapp-web.js usa.
-  // Sem isso o Chrome recusa iniciar porque o SingletonLock contém o hostname do container antigo.
-  try {
-    const r = spawnSync('find', ['/app/sessions', '-name', 'Singleton*', '-delete', '-print'], { encoding: 'utf8' })
-    if (r.stdout?.trim()) {
-      console.log(`[${ts()}] [${userId}] Chromium locks removidos: ${r.stdout.trim().replace(/\n/g, ', ')}`)
-    } else {
-      console.log(`[${ts()}] [${userId}] Chromium: nenhum lock encontrado em /app/sessions`)
-    }
-    if (r.stderr?.trim()) {
-      console.warn(`[${ts()}] [${userId}] find stderr: ${r.stderr.trim()}`)
-    }
-  } catch {}
-
   console.log(`[${ts()}] [${userId}] Lançando Chromium em /usr/bin/chromium...`)
   client.initialize()
   activeClients.set(userId, sessionData)
-  addPersistedSession(userId)
   console.log(`[${ts()}] [${userId}] client.initialize() chamado — aguardando QR ou autenticação automática`)
 }
 
@@ -690,10 +698,39 @@ app.post('/instance/disconnect/:userId', async (req: Request, res: Response) => 
   pausedNumbers.delete(userId)
   messageQueues.delete(userId)
   isSendingMessage.delete(userId)
-  removePersistedSession(userId)
 
   console.log(`[${ts()}] [${userId}] [DISCONNECT] Sessão removida — enviadas: ${session.sentMessages} | recebidas: ${session.receivedMessages} | chamadas API: ${session.apiCalls}`)
   res.json({ message: `Sessão ${userId} desconectada.`, userId, instanceId: session.instanceId })
+})
+
+app.delete('/instance/:userId', async (req: Request, res: Response) => {
+  const userId = getParam(req.params.userId)
+
+  const session = activeClients.get(userId)
+  if (session) {
+    session.destroyingIntentionally = true
+    try { await session.client.destroy() } catch {}
+    activeClients.delete(userId)
+    pausedNumbers.delete(userId)
+    messageQueues.delete(userId)
+    isSendingMessage.delete(userId)
+  }
+
+  // Remove credenciais do banco (RemoteAuth não chama delete sem logout explícito)
+  try {
+    await pool.query('DELETE FROM whatsapp_sessions WHERE session_id = $1', [`RemoteAuth-${userId}`])
+  } catch (e: any) {
+    console.error(`[${ts()}] [${userId}] [DELETE] Erro ao remover do banco:`, e?.message)
+  }
+
+  // Limpa diretório temporário do RemoteAuth em /tmp se ainda existir
+  const tempDir = `/tmp/wwebjs/wwebjs_temp_session_${userId}`
+  if (existsSync(tempDir)) {
+    try { rmSync(tempDir, { recursive: true, force: true }) } catch {}
+  }
+
+  console.log(`[${ts()}] [${userId}] [DELETE] Sessão deletada do banco e da memória`)
+  res.json({ message: `Sessão ${userId} deletada.`, userId })
 })
 
 app.all('/webhook/*splat', (_req: Request, res: Response) => {
@@ -1087,35 +1124,43 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
 process.on('SIGINT',  () => gracefulShutdown('SIGINT'))
 
 const PORT = process.env.PORT || 8080
-app.listen(PORT, () => {
-  console.log(`[${ts()}] [STARTUP] Backend WhatsApp rodando na porta ${PORT}`)
-  console.log(`[${ts()}] [STARTUP] Hostname:        ${hostname()}`)
-  console.log(`[${ts()}] [STARTUP] Sessões em:      /app/sessions`)
-  console.log(`[${ts()}] [STARTUP] API_KEY:         ${API_KEY ? 'configurada ✓' : 'NÃO CONFIGURADA ⚠'}`)
-  console.log(`[${ts()}] [STARTUP] WEBHOOK_URL:     ${process.env.WEBHOOK_URL || 'não configurada'}`)
-  console.log(`[${ts()}] [STARTUP] WEBHOOK_SECRET:  ${process.env.WEBHOOK_SECRET ? 'configurado ✓' : 'não configurado'}`)
-  console.log(`[${ts()}] [STARTUP] SENDERWHATS_URL: ${process.env.SENDERWHATS_URL || 'não configurada'}`)
 
-  const chromiumPath = '/usr/bin/chromium'
-  if (existsSync(chromiumPath)) {
-    const ver = spawnSync(chromiumPath, ['--version'], { encoding: 'utf8' })
-    console.log(`[${ts()}] [STARTUP] Chromium:        ${ver.stdout?.trim() || 'encontrado (versão indisponível)'}`)
-  } else {
-    console.error(`[${ts()}] [STARTUP] Chromium:        NÃO ENCONTRADO em ${chromiumPath} — instâncias falharão ao iniciar`)
-  }
+async function start() {
+  await initDatabase()
 
-  // Recupera sessões que estavam ativas antes do restart
-  const toRecover = loadPersistedSessions()
-  if (toRecover.length === 0) {
-    console.log(`[${ts()}] [STARTUP] Nenhuma sessão persistida para recuperar`)
-  } else {
-    console.log(`[${ts()}] [STARTUP] Recuperando ${toRecover.length} sessão(ões): ${toRecover.join(', ')}`)
-    toRecover.forEach((uid, index) => {
-      // Escalonar 5s entre cada sessão para não estourar RAM no boot
-      setTimeout(() => {
-        console.log(`[${ts()}] [STARTUP] Iniciando recuperação de: ${uid}`)
-        createSession(uid)
-      }, index * 5_000)
-    })
-  }
+  app.listen(PORT, async () => {
+    console.log(`[${ts()}] [STARTUP] Backend WhatsApp rodando na porta ${PORT}`)
+    console.log(`[${ts()}] [STARTUP] Hostname:        ${hostname()}`)
+    console.log(`[${ts()}] [STARTUP] API_KEY:         ${API_KEY ? 'configurada ✓' : 'NÃO CONFIGURADA ⚠'}`)
+    console.log(`[${ts()}] [STARTUP] WEBHOOK_URL:     ${process.env.WEBHOOK_URL || 'não configurada'}`)
+    console.log(`[${ts()}] [STARTUP] WEBHOOK_SECRET:  ${process.env.WEBHOOK_SECRET ? 'configurado ✓' : 'não configurado'}`)
+    console.log(`[${ts()}] [STARTUP] SENDERWHATS_URL: ${process.env.SENDERWHATS_URL || 'não configurada'}`)
+    console.log(`[${ts()}] [STARTUP] DATABASE_URL:    ${process.env.DATABASE_URL ? 'configurada ✓' : 'NÃO CONFIGURADA ⚠'}`)
+
+    const chromiumPath = '/usr/bin/chromium'
+    if (existsSync(chromiumPath)) {
+      const ver = spawnSync(chromiumPath, ['--version'], { encoding: 'utf8' })
+      console.log(`[${ts()}] [STARTUP] Chromium:        ${ver.stdout?.trim() || 'encontrado (versão indisponível)'}`)
+    } else {
+      console.error(`[${ts()}] [STARTUP] Chromium:        NÃO ENCONTRADO em ${chromiumPath} — instâncias falharão ao iniciar`)
+    }
+
+    const toRecover = await loadPersistedSessions()
+    if (toRecover.length === 0) {
+      console.log(`[${ts()}] [STARTUP] Nenhuma sessão no banco para recuperar`)
+    } else {
+      console.log(`[${ts()}] [STARTUP] Recuperando ${toRecover.length} sessão(ões): ${toRecover.join(', ')}`)
+      toRecover.forEach((uid: string, index: number) => {
+        setTimeout(() => {
+          console.log(`[${ts()}] [STARTUP] Iniciando recuperação de: ${uid}`)
+          createSession(uid)
+        }, index * 5_000)
+      })
+    }
+  })
+}
+
+start().catch(err => {
+  console.error(`[${ts()}] [STARTUP] Falha fatal ao iniciar:`, err)
+  process.exit(1)
 })
