@@ -15,14 +15,9 @@ import { Pool } from "pg"
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
 
 async function initDatabase(): Promise<void> {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS whatsapp_sessions (
-      session_id   VARCHAR(255) PRIMARY KEY,
-      session_data TEXT         NOT NULL,
-      updated_at   TIMESTAMP    NOT NULL DEFAULT NOW()
-    )
-  `)
-  console.log(`[${ts()}] [DB] Tabela whatsapp_sessions verificada/criada`)
+  // Tabela criada pelo admin — só verifica conectividade e acesso
+  await pool.query('SELECT 1 FROM whatsapp_sessions LIMIT 1')
+  console.log(`[${ts()}] [DB] Conexão verificada — whatsapp_sessions acessível`)
 }
 
 // Store implementando a interface do RemoteAuth
