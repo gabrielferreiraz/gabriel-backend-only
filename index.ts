@@ -336,6 +336,8 @@ function createSession(userId: string): void {
   let readyCount = 0
   let destroyingDueToLoop = false
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  let lastReadyAt = 0
+  let lastAuthenticatedAt = 0
 
   client.on('qr', (qr: string) => {
     qrcode.toDataURL(qr, (err: Error | null | undefined, url: string) => {
@@ -346,6 +348,12 @@ function createSession(userId: string): void {
   })
 
   client.on('ready', () => {
+    const now = Date.now()
+    if (now - lastReadyAt < 5_000) {
+      console.log(`[${ts()}] [${userId}] [READY] Evento duplicado ignorado (${now - lastReadyAt}ms desde o último)`)
+      return
+    }
+    lastReadyAt = now
     readyCount++
 
     if (readyCount > 5) {
@@ -375,14 +383,20 @@ function createSession(userId: string): void {
       try { await client.getState() } catch {}
     }, 30_000)
 
-    console.log(`[${ts()}] [${userId}] [READY] Instância pronta — número: ${sessionData.number} | readyAt: ${sessionData.readyAt.toISOString()} | uptime: ${uptimeSec}s`)
+    console.log(`[${ts()}] [${userId}] [READY] Instância pronta — número: ${sessionData.number} | ready #${readyCount} | uptime: ${uptimeSec}s`)
     processQueue(userId)
   })
 
   client.on('authenticated', () => {
+    const now = Date.now()
+    if (now - lastAuthenticatedAt < 5_000) {
+      console.log(`[${ts()}] [${userId}] [AUTHENTICATED] Evento duplicado ignorado (${now - lastAuthenticatedAt}ms desde o último)`)
+      return
+    }
+    lastAuthenticatedAt = now
     if (destroyingDueToLoop) return
     sessionData.authenticated = true
-    sessionData.qrCode = null // QR escaneado com sucesso, não é mais necessário
+    sessionData.qrCode = null
     sessionData.lastError = null
     console.log(`[${ts()}] [${userId}] [AUTHENTICATED] Sessão autenticada`)
   })
