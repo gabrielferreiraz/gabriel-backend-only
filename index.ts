@@ -1,76 +1,109 @@
 import express, { type Request, type Response, type NextFunction } from "express"
-import { Client, RemoteAuth, MessageMedia } from "whatsapp-web.js"
 import cors from "cors"
 import qrcode from "qrcode"
 import multer from "multer"
 import * as nodeCrypto from "node:crypto"
-import { existsSync, readFileSync, writeFileSync, rmSync } from "fs"
-import { spawnSync } from "child_process"
 import { hostname } from "os"
-import { join } from "path"
 import { Pool } from "pg"
+import makeWASocket, {
+  DisconnectReason,
+  initAuthCreds,
+  BufferJSON,
+  type AuthenticationCreds,
+  type SignalDataTypeMap,
+} from "@whiskeysockets/baileys"
+import { Boom } from "@hapi/boom"
+import pino from "pino"
 
 // ─── PostgreSQL ───────────────────────────────────────────────────────────────
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
 
 async function initDatabase(): Promise<void> {
-  // Tabela criada pelo admin — só verifica conectividade e acesso
-  await pool.query('SELECT 1 FROM whatsapp_sessions LIMIT 1')
-  console.log(`[${ts()}] [DB] Conexão verificada — whatsapp_sessions acessível`)
+  await pool.query('SELECT 1 FROM baileys_sessions LIMIT 1')
+  console.log(`[${ts()}] [DB] Conexão verificada — baileys_sessions acessível`)
 }
 
-// Store implementando a interface do RemoteAuth
-class PostgreSQLStore {
-  async sessionExists({ session }: { session: string }): Promise<boolean> {
-    const { rows } = await pool.query(
-      'SELECT 1 FROM whatsapp_sessions WHERE session_id = $1',
-      [session]
+async function usePostgreSQLAuthState(userId: string): Promise<{
+  state: { creds: AuthenticationCreds; keys: any }
+  saveCreds: () => Promise<void>
+}> {
+  const sessionKey = `baileys-${userId}`
+  const { rows } = await pool.query(
+    'SELECT creds, keys FROM baileys_sessions WHERE session_id = $1',
+    [sessionKey]
+  )
+  const row = rows[0]
+
+  let creds: AuthenticationCreds = row?.creds
+    ? (JSON.parse(row.creds, BufferJSON.reviver) as AuthenticationCreds)
+    : initAuthCreds()
+
+  let keysData: Record<string, Record<string, any>> = row?.keys
+    ? JSON.parse(row.keys, BufferJSON.reviver)
+    : {}
+
+  const saveCreds = async () => {
+    await pool.query(
+      `INSERT INTO baileys_sessions (session_id, creds, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (session_id) DO UPDATE SET creds = EXCLUDED.creds, updated_at = NOW()`,
+      [sessionKey, JSON.stringify(creds, BufferJSON.replacer)]
     )
-    return rows.length > 0
   }
 
-  async save({ session }: { session: string }): Promise<void> {
-    const zipPath = join(process.cwd(), `${session}.zip`)
-    const data = readFileSync(zipPath).toString('base64')
-    await pool.query(`
-      INSERT INTO whatsapp_sessions (session_id, session_data, updated_at)
-      VALUES ($1, $2, NOW())
-      ON CONFLICT (session_id) DO UPDATE
-        SET session_data = EXCLUDED.session_data, updated_at = NOW()
-    `, [session, data])
-  }
-
-  async extract({ session, path: targetPath }: { session: string; path: string }): Promise<void> {
-    const { rows } = await pool.query(
-      'SELECT session_data FROM whatsapp_sessions WHERE session_id = $1',
-      [session]
+  const saveKeys = async () => {
+    await pool.query(
+      `INSERT INTO baileys_sessions (session_id, keys, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (session_id) DO UPDATE SET keys = EXCLUDED.keys, updated_at = NOW()`,
+      [sessionKey, JSON.stringify(keysData, BufferJSON.replacer)]
     )
-    if (rows.length === 0) return
-    writeFileSync(join(targetPath, `${session}.zip`), Buffer.from(rows[0].session_data, 'base64'))
   }
 
-  async delete({ session }: { session: string }): Promise<void> {
-    await pool.query('DELETE FROM whatsapp_sessions WHERE session_id = $1', [session])
+  const keys = {
+    get: async <T extends keyof SignalDataTypeMap>(type: T, ids: string[]) => {
+      const result: { [id: string]: SignalDataTypeMap[T] } = {}
+      const store = keysData[type] ?? {}
+      for (const id of ids) {
+        if (store[id] !== undefined) result[id] = store[id]
+      }
+      return result
+    },
+    set: async (data: any) => {
+      for (const [type, typeData] of Object.entries(data)) {
+        keysData[type] ??= {}
+        for (const [id, val] of Object.entries(typeData as Record<string, any>)) {
+          if (val != null) keysData[type][id] = val
+          else delete keysData[type][id]
+        }
+      }
+      await saveKeys()
+    },
+    transaction: async (exec: () => Promise<void>) => exec(),
   }
+
+  return { state: { creds, keys }, saveCreds }
 }
 
 async function loadPersistedSessions(): Promise<string[]> {
   try {
-    const { rows } = await pool.query('SELECT session_id FROM whatsapp_sessions')
-    // session_id é 'RemoteAuth-gabriel_ferreira' → extrai só o userId
-    return rows.map((r: { session_id: string }) => r.session_id.replace(/^RemoteAuth-/, ''))
+    const { rows } = await pool.query(
+      'SELECT session_id FROM baileys_sessions WHERE creds IS NOT NULL'
+    )
+    return rows.map((r: { session_id: string }) => r.session_id.replace(/^baileys-/, ''))
   } catch (e: any) {
-    console.error(`[${ts()}] [DB] Erro ao carregar sessões persistidas:`, e?.message)
+    console.error(`[${ts()}] [DB] Erro ao carregar sessões:`, e?.message)
     return []
   }
 }
+
+// ─── Express ──────────────────────────────────────────────────────────────────
 
 const app = express()
 app.use(cors())
 app.use(express.json())
 
-// Log de cada requisição HTTP com método, rota, status e duração
 app.use((req: Request, res: Response, next: NextFunction) => {
   const start = Date.now()
   res.on('finish', () => {
@@ -85,14 +118,14 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 const API_KEY = process.env.API_KEY ?? ''
 if (!API_KEY) {
-  console.warn('[SEGURANÇA] API_KEY não configurada — servidor acessível sem autenticação. Defina API_KEY nas variáveis de ambiente.')
+  console.warn('[SEGURANÇA] API_KEY não configurada — servidor acessível sem autenticação.')
 }
 
 function authMiddleware(req: Request, res: Response, next: NextFunction) {
   if (!API_KEY) return next()
   const auth = req.headers.authorization
   if (!auth || auth !== `Bearer ${API_KEY}`) {
-    return res.status(401).json({ ok: false, error: 'unauthorized', details: 'API key inválida ou ausente. Envie o header: Authorization: Bearer <sua-chave>' })
+    return res.status(401).json({ ok: false, error: 'unauthorized' })
   }
   next()
 }
@@ -102,11 +135,9 @@ app.use('/message', authMiddleware)
 app.use('/messages', authMiddleware)
 app.use('/ia', authMiddleware)
 
-type MediaLog = {
-  mimetype: string
-  filename: string
-  data?: string
-}
+// ─── Tipos ────────────────────────────────────────────────────────────────────
+
+type MediaLog = { mimetype: string; filename: string; data?: string }
 
 type MessageLog = {
   messageId: string
@@ -141,57 +172,57 @@ type SendResult = {
 }
 
 type SessionData = {
-  client: Client
+  sock: ReturnType<typeof makeWASocket>
   qrCode: string | null
   ready: boolean
   authenticated: boolean
-  lastKnownState: string | null
   lastError: string | null
   userId: string
   instanceId: string
   logs: MessageLog[]
   createdAt: Date
-  readyAt: Date | null            // quando o evento ready disparou pela última vez
-  destroyingIntentionally: boolean // true quando desconexão é via API ou shutdown
+  readyAt: Date | null
+  destroyingIntentionally: boolean
   sentMessages: number
   receivedMessages: number
   apiCalls: number
   number?: string
+  retryCount: number
 }
 
-function generateUniqueId() {
-  return nodeCrypto.randomUUID()
-}
+// ─── Utilitários ──────────────────────────────────────────────────────────────
 
-function ts(): string {
-  return new Date().toISOString().replace('T', ' ').slice(0, 23)
-}
+function generateUniqueId() { return nodeCrypto.randomUUID() }
+function ts(): string { return new Date().toISOString().replace('T', ' ').slice(0, 23) }
 
 const ACK_LABELS: Record<number, string> = {
   0: 'pendente', 1: 'enviada', 2: 'entregue', 3: 'lida', 4: 'reproduzida',
 }
 
-const activeClients  = new Map<string, SessionData>()
-const pausedNumbers  = new Map<string, Set<string>>()
-const messageQueues  = new Map<string, QueueItem[]>()
+// Baileys status → whatsapp-web.js ack values
+const BAILEYS_STATUS_TO_ACK: Record<number, number> = {
+  2: 1,  // SERVER_ACK
+  3: 2,  // DELIVERY_ACK → entregue
+  4: 3,  // READ → lida
+  5: 4,  // PLAYED → reproduzida
+}
+
+const activeClients    = new Map<string, SessionData>()
+const pausedNumbers    = new Map<string, Set<string>>()
+const messageQueues    = new Map<string, QueueItem[]>()
 const isSendingMessage = new Map<string, boolean>()
 const messageRegistry  = new Map<string, RegistryPayload>()
 
-const MAX_REGISTRY_SIZE      = 5000
-const MAX_SESSION_LOGS       = 200
+const MAX_REGISTRY_SIZE       = 5000
+const MAX_SESSION_LOGS        = 200
 const WHATSAPP_MEDIA_LIMIT_MB = 16
-const SEND_TIMEOUT_MS        = 60_000
-const READY_WARMUP_MS        = 5_000  // warm-up após ready antes de aceitar envios
+const SEND_TIMEOUT_MS         = 60_000
 
 const ALLOWED_IMAGE_MIMETYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp'])
 const ALLOWED_AUDIO_MIMETYPES = new Set([
   'audio/ogg', 'audio/mpeg', 'audio/mp3', 'audio/mp4',
   'audio/wav', 'audio/wave', 'audio/x-wav', 'audio/aac', 'audio/webm',
 ])
-const IGNORED_WEBHOOK_TYPES = new Set([
-  'notification_template', 'notification', 'e2e_notification', 'call_log', 'protocol',
-])
-
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -208,7 +239,7 @@ const uploadAudio = multer({
   fileFilter: (_req, file, cb) => {
     const baseMime = file.mimetype.split(';')[0].trim()
     if (ALLOWED_AUDIO_MIMETYPES.has(baseMime)) cb(null, true)
-    else cb(new Error(`Tipo não suportado: ${file.mimetype}. Use OGG, MP3, WAV, MP4 ou AAC.`))
+    else cb(new Error(`Tipo não suportado: ${file.mimetype}.`))
   },
 })
 
@@ -225,354 +256,281 @@ function getParam(value: string | string[] | undefined): string {
 function computeSessionStatus(session: SessionData): 'ready' | 'qr_pending' | 'initializing' | 'disconnected' {
   if (session.ready) return 'ready'
   if (session.qrCode) return 'qr_pending'
-  if (session.lastKnownState === 'DISCONNECTED') return 'disconnected'
+  if (session.destroyingIntentionally) return 'disconnected'
   return 'initializing'
 }
 
-function isInWarmup(session: SessionData): boolean {
-  return session.readyAt !== null && Date.now() - session.readyAt.getTime() < READY_WARMUP_MS
+function deriveState(session: SessionData): string {
+  if (session.ready) return 'CONNECTED'
+  if (session.qrCode) return 'QR_PENDING'
+  if (session.destroyingIntentionally) return 'DISCONNECTED'
+  return 'INITIALIZING'
 }
 
-function isWidFactoryError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err)
-  return msg.includes('WidFactory')
-}
+// ─── Criação de sessão (Baileys) ──────────────────────────────────────────────
 
-async function syncSessionReadiness(session: SessionData): Promise<string | null> {
-  try {
-    const state = await session.client.getState().catch(() => null)
-    session.lastKnownState = state
-    if (state === 'CONNECTED') {
-      session.ready = true
-      session.authenticated = true
-    } else if (state !== null) {
-      session.ready = false
-    }
-    return state
-  } catch (err) {
-    session.lastError = err instanceof Error ? err.message : String(err)
-    return null
-  }
-}
-
-// ─── /instance/create ────────────────────────────────────────────────────────
-
-function createSession(userId: string): void {
-  if (activeClients.has(userId)) return
+function createSession(userId: string): string {
+  if (activeClients.has(userId)) return activeClients.get(userId)!.instanceId
 
   const instanceId = generateUniqueId()
-  console.log(`[${ts()}] [${userId}] Criando nova sessão (instanceId: ${instanceId})...`)
+  console.log(`[${ts()}] [${userId}] Criando sessão Baileys (instanceId: ${instanceId})...`)
 
-  const client = new Client({
-    authStrategy: new RemoteAuth({
-      clientId: userId,
-      dataPath: '/tmp/wwebjs',
-      store: new PostgreSQLStore(),
-      backupSyncIntervalMs: 300_000,
-    }),
-    puppeteer: {
-      executablePath: '/usr/bin/chromium',
-      headless: true,
-      args: [
-        // Segurança / Docker obrigatório
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
+  ;(async () => {
+    const { state, saveCreds } = await usePostgreSQLAuthState(userId)
 
-        // GPU / renderização (não usados em headless)
-        '--disable-gpu',
-        '--disable-accelerated-2d-canvas',
-        '--disable-software-rasterizer',
-
-        // Subsistemas desnecessários para WhatsApp Web
-        '--disable-extensions',
-        '--disable-component-extensions-with-background-pages',
-        '--disable-default-apps',
-        '--disable-sync',
-        '--disable-translate',
-        '--hide-scrollbars',
-        '--mute-audio',
-        '--disable-background-timer-throttling',
-        '--disable-renderer-backgrounding',
-        '--disable-client-side-phishing-detection',
-        '--disable-hang-monitor',
-        '--disable-prompt-on-repost',
-        '--disable-features=TranslateUI,Translate',
-        '--disable-ipc-flooding-protection',
-
-        // Cache mínimo (reduz uso de disco e memória mapeada)
-        '--disk-cache-size=1',
-        '--media-cache-size=1',
-      ],
-    },
-  })
-
-  const sessionData: SessionData = {
-    client,
-    qrCode: null,
-    ready: false,
-    authenticated: false,
-    lastKnownState: null,
-    lastError: null,
-    userId,
-    instanceId,
-    logs: [],
-    createdAt: new Date(),
-    readyAt: null,
-    destroyingIntentionally: false,
-    sentMessages: 0,
-    receivedMessages: 0,
-    apiCalls: 0,
-  }
-
-  let readyCount = 0
-  let destroyingDueToLoop = false
-  let heartbeatTimer: ReturnType<typeof setInterval> | null = null
-  let lastReadyAt = 0
-  let lastAuthenticatedAt = 0
-
-  client.on('qr', (qr: string) => {
-    qrcode.toDataURL(qr, (err: Error | null | undefined, url: string) => {
-      if (err) { console.error(`[${ts()}] [${userId}] [QR] Erro ao gerar QR:`, err); return }
-      sessionData.qrCode = url
-      console.log(`[${ts()}] [${userId}] [QR] QR gerado, aguardando scan`)
+    const sock = makeWASocket({
+      auth: state,
+      logger: pino({ level: 'silent' }),
+      printQRInTerminal: false,
+      browser: ['SenderWhats', 'Chrome', '120.0.6099.71'] as [string, string, string],
+      connectTimeoutMs: 60_000,
+      defaultQueryTimeoutMs: 60_000,
+      keepAliveIntervalMs: 30_000,
+      generateHighQualityLinkPreview: false,
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
     })
-  })
 
-  client.on('ready', () => {
-    const now = Date.now()
-    if (now - lastReadyAt < 5_000) {
-      console.log(`[${ts()}] [${userId}] [READY] Evento duplicado ignorado (${now - lastReadyAt}ms desde o último)`)
-      return
+    const sessionData: SessionData = {
+      sock,
+      qrCode: null,
+      ready: false,
+      authenticated: false,
+      lastError: null,
+      userId,
+      instanceId,
+      logs: [],
+      createdAt: new Date(),
+      readyAt: null,
+      destroyingIntentionally: false,
+      sentMessages: 0,
+      receivedMessages: 0,
+      apiCalls: 0,
+      retryCount: 0,
     }
-    lastReadyAt = now
-    readyCount++
+    activeClients.set(userId, sessionData)
 
-    if (readyCount > 5) {
-      if (!destroyingDueToLoop) {
-        destroyingDueToLoop = true
-        console.error(`[${ts()}] [${userId}] [LOOP] Loop de inicialização detectado (ready #${readyCount}) — encerrando sessão para proteger o número`)
+    // Salva credenciais sempre que atualizadas
+    sock.ev.on('creds.update', saveCreds)
+
+    // ── Eventos de conexão ──
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update
+
+      if (qr) {
+        qrcode.toDataURL(qr, (err: Error | null | undefined, url: string) => {
+          if (!err) {
+            sessionData.qrCode = url
+            console.log(`[${ts()}] [${userId}] [QR] Novo QR code gerado — aguardando scan`)
+          }
+        })
+      }
+
+      if (connection === 'open') {
+        const rawId = sock.user?.id ?? ''
+        const number = rawId.split(':')[0].split('@')[0]
+        const uptime = Math.round((Date.now() - sessionData.createdAt.getTime()) / 1000)
+        sessionData.ready = true
+        sessionData.authenticated = true
+        sessionData.qrCode = null
+        sessionData.lastError = null
+        sessionData.readyAt = new Date()
+        sessionData.retryCount = 0
+        sessionData.number = number
+        console.log(`[${ts()}] [${userId}] [READY] Conexão aberta — número: ${number} | uptime: ${uptime}s`)
+        processQueue(userId)
+      }
+
+      if (connection === 'close') {
         sessionData.ready = false
         sessionData.authenticated = false
-        sessionData.lastKnownState = 'DISCONNECTED'
-        sessionData.lastError = `Loop detectado após ${readyCount} eventos ready. Reinicie via /instance/disconnect/${userId} e /instance/create/${userId}.`
-        client.destroy().catch(() => {})
-      }
-      return
-    }
+        sessionData.qrCode = null
 
-    const uptimeSec = Math.round((Date.now() - sessionData.createdAt.getTime()) / 1000)
-    sessionData.ready = true
-    sessionData.authenticated = true
-    sessionData.lastKnownState = 'CONNECTED'
-    sessionData.lastError = null
-    sessionData.readyAt = new Date()
-    sessionData.number = client.info.wid.user
+        // Drena fila pendente
+        const queue = messageQueues.get(userId)
+        if (queue && queue.length > 0) {
+          const pending = queue.splice(0)
+          for (const item of pending) item.reject(new Error('Sessão desconectada. Tente novamente.'))
+          console.warn(`[${ts()}] [${userId}] [DISCONNECT] Fila drenada: ${pending.length} item(ns)`)
+        }
 
-    // Heartbeat a cada 30s para evitar desconexão por inatividade
-    if (heartbeatTimer) clearInterval(heartbeatTimer)
-    heartbeatTimer = setInterval(async () => {
-      try { await client.getState() } catch {}
-    }, 30_000)
+        const err = lastDisconnect?.error as Boom | undefined
+        const statusCode = err?.output?.statusCode
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut
 
-    console.log(`[${ts()}] [${userId}] [READY] Instância pronta — número: ${sessionData.number} | ready #${readyCount} | uptime: ${uptimeSec}s`)
-    processQueue(userId)
-  })
-
-  client.on('authenticated', () => {
-    const now = Date.now()
-    if (now - lastAuthenticatedAt < 5_000) {
-      console.log(`[${ts()}] [${userId}] [AUTHENTICATED] Evento duplicado ignorado (${now - lastAuthenticatedAt}ms desde o último)`)
-      return
-    }
-    lastAuthenticatedAt = now
-    if (destroyingDueToLoop) return
-    sessionData.authenticated = true
-    sessionData.qrCode = null
-    sessionData.lastError = null
-    console.log(`[${ts()}] [${userId}] [AUTHENTICATED] Sessão autenticada`)
-  })
-
-  client.on('auth_failure', (message: string) => {
-    sessionData.ready = false
-    sessionData.authenticated = false
-    sessionData.lastError = message || 'auth_failure'
-    console.error(`[${ts()}] [${userId}] [AUTH_FAIL] Falha de autenticação: ${message}`)
-  })
-
-  client.on('change_state', (state: string) => {
-    const prev = sessionData.lastKnownState ?? '?'
-    sessionData.lastKnownState = state
-    console.log(`[${ts()}] [${userId}] [STATE] ${prev} → ${state}`)
-    if (state === 'CONNECTED') {
-      sessionData.ready = true
-      sessionData.authenticated = true
-      processQueue(userId)
-    }
-    if (state === 'UNPAIRED' || state === 'UNPAIRED_IDLE' || state === 'DISCONNECTED') {
-      sessionData.ready = false
-    }
-  })
-
-  client.on('disconnected', async (reason: string) => {
-    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null }
-
-    sessionData.ready = false
-    sessionData.authenticated = false
-    sessionData.lastKnownState = 'DISCONNECTED'
-    sessionData.lastError = reason || null
-    sessionData.qrCode = null
-    console.warn(`[${ts()}] [${userId}] [DISCONNECTED] Razão: ${reason || '(sem motivo)'}`)
-
-    const queue = messageQueues.get(userId)
-    if (queue && queue.length > 0) {
-      const pending = queue.splice(0)
-      console.warn(`[${ts()}] [${userId}] [DISCONNECTED] Fila drenada: ${pending.length} mensagem(ns) rejeitada(s)`)
-      for (const item of pending) item.reject(new Error('Sessão desconectada. Tente novamente.'))
-    }
-
-    if (sessionData.destroyingIntentionally || destroyingDueToLoop) return
-
-    console.log(`[${ts()}] [${userId}] [RECONNECT] Aguardando 5s para reinicializar...`)
-    await new Promise<void>(r => setTimeout(r, 5000))
-
-    if (!activeClients.has(userId) || sessionData.destroyingIntentionally) {
-      console.log(`[${ts()}] [${userId}] [RECONNECT] Abortado — sessão removida durante a espera`)
-      return
-    }
-
-    // Reseta contadores para que a reconexão automática não dispare a proteção de loop
-    readyCount = 0
-    destroyingDueToLoop = false
-    sessionData.lastKnownState = null // mostra 'initializing' durante a reconexão
-
-    try {
-      await client.initialize()
-      console.log(`[${ts()}] [${userId}] [RECONNECT] Reinicialização iniciada`)
-    } catch (err) {
-      console.error(`[${ts()}] [${userId}] [RECONNECT] Falha ao reinicializar:`, err)
-    }
-  })
-
-  client.on('message_ack', async (msg: any, ack: number) => {
-    if (ack < 2) return
-    const senderwhatsUrl = process.env.SENDERWHATS_URL
-    if (!senderwhatsUrl) return
-
-    const messageId = msg.id._serialized
-    const ackName = ACK_LABELS[ack] ?? `ack-${ack}`
-    const msgShort = messageId.slice(-10)
-    console.log(`[${ts()}] [${userId}] [ACK] ...${msgShort} → ${ackName}`)
-
-    const webhookSecret = process.env.WEBHOOK_SECRET
-    const t0 = Date.now()
-    try {
-      const res = await fetch(`${senderwhatsUrl}/api/webhooks/message-ack`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(webhookSecret ? { 'x-webhook-secret': webhookSecret } : {}),
-        },
-        body: JSON.stringify({ messageId, ack, userId }),
-        signal: AbortSignal.timeout(8000),
-      })
-      if (!res.ok) console.warn(`[${ts()}] [${userId}] [ACK] webhook → ${res.status} para ...${msgShort} (${Date.now() - t0}ms)`)
-      else console.log(`[${ts()}] [${userId}] [ACK] webhook → OK para ...${msgShort} (${Date.now() - t0}ms)`)
-    } catch (err) {
-      if (err instanceof Error && err.name !== 'TimeoutError' && err.name !== 'AbortError') {
-        console.error(`[${ts()}] [${userId}] [ACK] webhook erro para ...${msgShort}:`, err.message)
-      }
-    }
-  })
-
-  client.on('message', async (msg: any) => {
-    try {
-      if (msg.from.endsWith('@g.us') || msg.from.endsWith('@newsletter') || IGNORED_WEBHOOK_TYPES.has(msg.type)) return
-
-      sessionData.receivedMessages++
-      const contact = await msg.getContact().catch(() => null)
-      const contactName = contact?.pushname || contact?.name || contact?.number || msg.from
-      const from = msg.from.endsWith('@lid')
-        ? (contact?.number ?? msg.from.replace('@lid', ''))
-        : msg.from.replace('@c.us', '')
-      const rawBody = msg.body ?? ''
-      const preview = rawBody.slice(0, 80).replace(/\n/g, ' ')
-      const previewFmt = msg.type === 'ptt' ? '[ptt/áudio]'
-        : rawBody.length > 0 ? `"${preview}${rawBody.length > 80 ? '...' : ''}"` : `[${msg.type}]`
-      console.log(`[${ts()}] [${userId}] [MSG] ← de ${from} (${contactName}) ${previewFmt} | total: ${sessionData.receivedMessages}`)
-
-      const messageId = generateUniqueId()
-      cappedMapSet(messageRegistry, messageId, {
-        userId, instanceId, timestamp: new Date(), type: 'received', whatsappMessageId: msg.id._serialized
-      }, MAX_REGISTRY_SIZE)
-
-      const log: MessageLog = {
-        messageId, userId, instanceId, number: msg.from, name: contactName,
-        body: msg.body, type: msg.type, direction: 'received',
-        timestamp: new Date(), media: null, whatsappMessageId: msg.id._serialized,
-      }
-
-      if (msg.hasMedia && msg.type === 'ptt') {
-        try {
-          const media = await msg.downloadMedia()
-          if (media) {
-            log.media = { mimetype: media.mimetype, data: media.data, filename: `audio-${Date.now()}.ogg` }
-            console.log(`[${ts()}] [${userId}] [MSG] PTT recebido de ${from} — download OK`)
-          }
-        } catch (err: any) {
-          console.error(`[${ts()}] [${userId}] [MSG] Erro ao baixar PTT de ${from}: ${err?.message}`)
+        if (isLoggedOut) {
+          console.warn(`[${ts()}] [${userId}] [DISCONNECT] Logout detectado — credenciais removidas`)
+          sessionData.lastError = 'Desconectado (logout). Escaneie o QR novamente.'
+          await pool.query(
+            'DELETE FROM baileys_sessions WHERE session_id = $1',
+            [`baileys-${userId}`]
+          ).catch(() => {})
+        } else if (!sessionData.destroyingIntentionally) {
+          sessionData.retryCount++
+          console.log(`[${ts()}] [${userId}] [RECONNECT] Reconectando em 5s... (código: ${statusCode ?? '?'}, tentativa ${sessionData.retryCount})`)
+          setTimeout(() => {
+            if (activeClients.has(userId) && !sessionData.destroyingIntentionally) {
+              activeClients.delete(userId)
+              createSession(userId)
+            }
+          }, 5_000)
+        } else {
+          console.log(`[${ts()}] [${userId}] [DISCONNECT] Encerrado intencionalmente`)
         }
       }
+    })
 
-      sessionData.logs.push(log)
-      if (sessionData.logs.length > MAX_SESSION_LOGS) sessionData.logs.shift()
+    // ── ACK de entrega / leitura ──
+    sock.ev.on('messages.update', async (msgs) => {
+      const senderwhatsUrl = process.env.SENDERWHATS_URL
+      if (!senderwhatsUrl) return
+      const webhookSecret = process.env.WEBHOOK_SECRET
 
-      if (pausedNumbers.get(userId)?.has(msg.from)) {
-        console.log(`[${ts()}] [${userId}] [MSG] IA pausada para ${from} — mensagem registrada`)
-      }
+      for (const { key, update } of msgs) {
+        if (!key.fromMe) continue
+        const ack = BAILEYS_STATUS_TO_ACK[update.status ?? 0] ?? 0
+        if (ack < 2) continue
 
-      const webhookUrl = process.env.WEBHOOK_URL
-      if (webhookUrl && !msg.fromMe) {
-        const controller = new AbortController()
-        const timer = setTimeout(() => controller.abort(), 5000)
+        const messageId = key.id ?? ''
+        const ackName = ACK_LABELS[ack] ?? `ack-${ack}`
+        console.log(`[${ts()}] [${userId}] [ACK] ...${messageId.slice(-10)} → ${ackName}`)
+
         const t0 = Date.now()
         try {
-          const webhookSecret = process.env.WEBHOOK_SECRET
-          const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-          if (webhookSecret) headers['Authorization'] = `Bearer ${webhookSecret}`
-          const webhookRes = await fetch(webhookUrl, {
-            method: 'POST', headers, signal: controller.signal,
-            body: JSON.stringify({ userId, instanceId, from, body: rawBody, timestamp: msg.timestamp }),
+          const res = await fetch(`${senderwhatsUrl}/api/webhooks/message-ack`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(webhookSecret ? { 'x-webhook-secret': webhookSecret } : {}),
+            },
+            body: JSON.stringify({ messageId, ack, userId }),
+            signal: AbortSignal.timeout(8000),
           })
-          const ms = Date.now() - t0
-          if (!webhookRes.ok) console.error(`[${ts()}] [${userId}] [WEBHOOK] → ${webhookRes.status} (${ms}ms)`)
-          else console.log(`[${ts()}] [${userId}] [WEBHOOK] → OK (${ms}ms)`)
-        } catch (err: any) {
-          console.error(`[${ts()}] [${userId}] [WEBHOOK] falhou (${Date.now() - t0}ms):`, err?.message ?? err)
-        } finally {
-          clearTimeout(timer)
+          if (!res.ok) console.warn(`[${ts()}] [${userId}] [ACK] webhook → ${res.status} (${Date.now() - t0}ms)`)
+          else console.log(`[${ts()}] [${userId}] [ACK] webhook → OK (${Date.now() - t0}ms)`)
+        } catch (e: any) {
+          if (e?.name !== 'TimeoutError' && e?.name !== 'AbortError') {
+            console.error(`[${ts()}] [${userId}] [ACK] webhook erro:`, e?.message)
+          }
         }
       }
-    } catch (err: any) {
-      console.error(`[${ts()}] [${userId}] [MSG] Erro ao processar mensagem recebida:`, err?.message ?? err)
-    }
+    })
+
+    // ── Mensagens recebidas ──
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return
+
+      for (const msg of messages) {
+        try {
+          if (msg.key.fromMe) continue
+
+          const jid = msg.key.remoteJid ?? ''
+          if (jid.endsWith('@g.us') || jid.endsWith('@newsletter') || jid.endsWith('@broadcast')) continue
+
+          const msgContent = msg.message ?? {}
+          const msgType = Object.keys(msgContent)[0] ?? 'unknown'
+          const IGNORED_TYPES = ['protocolMessage', 'senderKeyDistributionMessage', 'reactionMessage', 'pollUpdateMessage', 'ephemeralMessage']
+          if (IGNORED_TYPES.includes(msgType)) continue
+
+          sessionData.receivedMessages++
+          const from = jid.replace('@s.whatsapp.net', '')
+          const pushName = msg.pushName || from
+
+          // Extrai corpo e tipo de mídia
+          let rawBody = ''
+          let hasMedia = false
+          let msgTypeName = 'chat'
+
+          if (msgContent.conversation) {
+            rawBody = msgContent.conversation
+            msgTypeName = 'chat'
+          } else if (msgContent.extendedTextMessage?.text) {
+            rawBody = msgContent.extendedTextMessage.text
+            msgTypeName = 'chat'
+          } else if (msgContent.imageMessage) {
+            rawBody = msgContent.imageMessage.caption ?? ''
+            hasMedia = true; msgTypeName = 'image'
+          } else if (msgContent.audioMessage) {
+            hasMedia = true
+            msgTypeName = msgContent.audioMessage.ptt ? 'ptt' : 'audio'
+          } else if (msgContent.videoMessage) {
+            rawBody = msgContent.videoMessage.caption ?? ''
+            hasMedia = true; msgTypeName = 'video'
+          } else if (msgContent.documentMessage) {
+            rawBody = msgContent.documentMessage.title ?? ''
+            hasMedia = true; msgTypeName = 'document'
+          } else if (msgContent.stickerMessage) {
+            hasMedia = true; msgTypeName = 'sticker'
+          }
+
+          const preview = rawBody.slice(0, 80).replace(/\n/g, ' ')
+          const previewFmt = msgTypeName === 'ptt' ? '[ptt/áudio]'
+            : rawBody.length > 0 ? `"${preview}${rawBody.length > 80 ? '...' : ''}"` : `[${msgTypeName}]`
+          console.log(`[${ts()}] [${userId}] [MSG] ← de ${from} (${pushName}) ${previewFmt} | total: ${sessionData.receivedMessages}`)
+
+          const messageId = generateUniqueId()
+          const whatsappMsgId = msg.key.id ?? ''
+
+          cappedMapSet(messageRegistry, messageId, {
+            userId, instanceId, timestamp: new Date(), type: 'received', whatsappMessageId: whatsappMsgId,
+          }, MAX_REGISTRY_SIZE)
+
+          const log: MessageLog = {
+            messageId, userId, instanceId, number: from, name: pushName,
+            body: rawBody, type: msgTypeName, direction: 'received',
+            timestamp: new Date(), media: null, whatsappMessageId: whatsappMsgId,
+          }
+          sessionData.logs.push(log)
+          if (sessionData.logs.length > MAX_SESSION_LOGS) sessionData.logs.shift()
+
+          const webhookUrl = process.env.WEBHOOK_URL
+          if (webhookUrl) {
+            const controller = new AbortController()
+            const timer = setTimeout(() => controller.abort(), 5000)
+            const t0 = Date.now()
+            try {
+              const webhookSecret = process.env.WEBHOOK_SECRET
+              const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+              if (webhookSecret) headers['Authorization'] = `Bearer ${webhookSecret}`
+              const webhookRes = await fetch(webhookUrl, {
+                method: 'POST', headers, signal: controller.signal,
+                body: JSON.stringify({
+                  userId, instanceId, from, body: rawBody,
+                  type: msgTypeName, hasMedia,
+                  timestamp: Math.floor(Date.now() / 1000),
+                }),
+              })
+              const ms = Date.now() - t0
+              if (!webhookRes.ok) console.error(`[${ts()}] [${userId}] [WEBHOOK] → ${webhookRes.status} (${ms}ms)`)
+              else console.log(`[${ts()}] [${userId}] [WEBHOOK] → OK (${ms}ms)`)
+            } catch (e: any) {
+              console.error(`[${ts()}] [${userId}] [WEBHOOK] falhou (${Date.now() - t0}ms):`, e?.message ?? e)
+            } finally {
+              clearTimeout(timer)
+            }
+          }
+        } catch (e: any) {
+          console.error(`[${ts()}] [${userId}] [MSG] Erro ao processar mensagem:`, e?.message ?? e)
+        }
+      }
+    })
+
+    console.log(`[${ts()}] [${userId}] Socket Baileys inicializado`)
+  })().catch(err => {
+    console.error(`[${ts()}] [${userId}] Erro ao criar sessão Baileys:`, err?.message ?? err)
+    activeClients.delete(userId)
   })
 
-  console.log(`[${ts()}] [${userId}] Lançando Chromium em /usr/bin/chromium...`)
-  client.initialize()
-  activeClients.set(userId, sessionData)
-  console.log(`[${ts()}] [${userId}] client.initialize() chamado — aguardando QR ou autenticação automática`)
+  return instanceId
 }
+
+// ─── GET /instance/create/:userId ────────────────────────────────────────────
 
 app.get('/instance/create/:userId', (req: Request, res: Response) => {
   const userId = getParam(req.params.userId)
 
   if (activeClients.has(userId)) {
     const existing = activeClients.get(userId)!
-    console.log(`[${ts()}] [${userId}] Sessão já existe — ready=${existing.ready} state=${existing.lastKnownState ?? '?'}`)
     return res.status(200).json({
       message: 'Sessão já existe',
       status: 'existing',
@@ -580,13 +538,16 @@ app.get('/instance/create/:userId', (req: Request, res: Response) => {
       instanceId: existing.instanceId,
       ready: existing.ready,
       authenticated: existing.authenticated,
-      state: existing.lastKnownState,
+      state: deriveState(existing),
     })
   }
 
-  createSession(userId)
-  const session = activeClients.get(userId)!
-  res.status(200).json({ message: `Instância '${userId}' criada com sucesso.`, userId, instanceId: session.instanceId })
+  const instanceId = createSession(userId)
+  res.status(200).json({
+    message: `Instância '${userId}' criada com sucesso.`,
+    userId,
+    instanceId,
+  })
 })
 
 // ─── Logs / consultas ─────────────────────────────────────────────────────────
@@ -606,7 +567,7 @@ app.get('/messages/log/:userId', (req: Request, res: Response) => {
   let logs = direction === 'sent' || direction === 'received'
     ? session.logs.filter(l => l.direction === direction)
     : session.logs
-  if (number) logs = logs.filter(l => l.number === number || l.number === `${number}@c.us`)
+  if (number) logs = logs.filter(l => l.number === number)
   if (sinceValid) logs = logs.filter(l => new Date(l.timestamp) > sinceDate!)
 
   res.json({ userId, instanceId: session.instanceId, total: logs.length, logs })
@@ -614,26 +575,11 @@ app.get('/messages/log/:userId', (req: Request, res: Response) => {
 
 // ─── Instance info ────────────────────────────────────────────────────────────
 
-app.get('/instance/chats/:userId', async (req: Request, res: Response) => {
-  const userId = getParam(req.params.userId)
-  const session = activeClients.get(userId)
-  if (!session) return res.status(404).send('Sessão não encontrada.')
-  session.apiCalls++
-  await syncSessionReadiness(session)
-  if (!session.ready) return res.status(400).send('Instância não pronta.')
-  try {
-    const chats = await session.client.getChats()
-    const list = chats.map((chat: { id: { _serialized: string; user?: string }; name?: string; formattedTitle?: string }) => ({
-      id: chat.id._serialized, name: chat.name || chat.formattedTitle || chat.id.user,
-    }))
-    res.json({ userId, instanceId: session.instanceId, total: list.length, chats: list })
-  } catch (err: any) {
-    console.error(err)
-    res.status(500).send('Erro ao buscar chats.')
-  }
+app.get('/instance/chats/:userId', (_req: Request, res: Response) => {
+  res.status(501).json({ ok: false, error: 'not_implemented', message: 'getChats não disponível com Baileys. Use o banco de dados do SenderWhats.' })
 })
 
-app.get('/instance/status/:userId', async (req: Request, res: Response) => {
+app.get('/instance/status/:userId', (req: Request, res: Response) => {
   const userId = getParam(req.params.userId)
   const session = activeClients.get(userId)
   if (!session) {
@@ -642,12 +588,11 @@ app.get('/instance/status/:userId', async (req: Request, res: Response) => {
     })
   }
   session.apiCalls++
-  await syncSessionReadiness(session)
   res.json({
     userId,
     instanceId: session.instanceId,
     status: computeSessionStatus(session),
-    state: session.lastKnownState,
+    state: deriveState(session),
     authenticated: session.authenticated,
     readySince: session.readyAt?.toISOString() ?? null,
     lastError: session.lastError,
@@ -671,22 +616,21 @@ app.get('/instance/active', (_req: Request, res: Response) => {
     users.push({
       userId, instanceId: session.instanceId, number: session.number || null,
       ready: session.ready, authenticated: session.authenticated,
-      state: session.lastKnownState, queueLength: messageQueues.get(userId)?.length || 0,
+      state: deriveState(session), queueLength: messageQueues.get(userId)?.length || 0,
     })
   }
   res.json({ total: users.length, instances: users })
 })
 
-app.get('/instance/info/:userId', async (req: Request, res: Response) => {
+app.get('/instance/info/:userId', (req: Request, res: Response) => {
   const userId = getParam(req.params.userId)
   const session = activeClients.get(userId)
   if (!session) return res.status(404).send('Sessão não encontrada.')
   session.apiCalls++
-  await syncSessionReadiness(session)
   res.json({
     userId: session.userId, instanceId: session.instanceId,
     ready: session.ready, authenticated: session.authenticated,
-    state: session.lastKnownState, lastError: session.lastError,
+    state: deriveState(session), lastError: session.lastError,
     createdAt: session.createdAt, readySince: session.readyAt?.toISOString() ?? null,
     number: session.number || null, queueLength: messageQueues.get(userId)?.length || 0,
   })
@@ -698,17 +642,16 @@ app.post('/instance/disconnect/:userId', async (req: Request, res: Response) => 
   if (!session) return res.status(404).send('Sessão não encontrada.')
   session.apiCalls++
 
-  console.log(`[${ts()}] [${userId}] [DISCONNECT] Desconectando sessão (instanceId: ${session.instanceId})...`)
-  session.destroyingIntentionally = true // impede reconexão automática
-
-  try { await session.client.logout(); await session.client.destroy() } catch {}
+  console.log(`[${ts()}] [${userId}] [DISCONNECT] Desconectando...`)
+  session.destroyingIntentionally = true
+  try { session.sock.end(undefined) } catch {}
 
   activeClients.delete(userId)
   pausedNumbers.delete(userId)
   messageQueues.delete(userId)
   isSendingMessage.delete(userId)
 
-  console.log(`[${ts()}] [${userId}] [DISCONNECT] Sessão removida — enviadas: ${session.sentMessages} | recebidas: ${session.receivedMessages} | chamadas API: ${session.apiCalls}`)
+  console.log(`[${ts()}] [${userId}] [DISCONNECT] Sessão removida — enviadas: ${session.sentMessages} | recebidas: ${session.receivedMessages}`)
   res.json({ message: `Sessão ${userId} desconectada.`, userId, instanceId: session.instanceId })
 })
 
@@ -718,32 +661,25 @@ app.delete('/instance/:userId', async (req: Request, res: Response) => {
   const session = activeClients.get(userId)
   if (session) {
     session.destroyingIntentionally = true
-    try { await session.client.destroy() } catch {}
+    try { session.sock.end(undefined) } catch {}
     activeClients.delete(userId)
     pausedNumbers.delete(userId)
     messageQueues.delete(userId)
     isSendingMessage.delete(userId)
   }
 
-  // Remove credenciais do banco (RemoteAuth não chama delete sem logout explícito)
   try {
-    await pool.query('DELETE FROM whatsapp_sessions WHERE session_id = $1', [`RemoteAuth-${userId}`])
+    await pool.query('DELETE FROM baileys_sessions WHERE session_id = $1', [`baileys-${userId}`])
   } catch (e: any) {
     console.error(`[${ts()}] [${userId}] [DELETE] Erro ao remover do banco:`, e?.message)
   }
 
-  // Limpa diretório temporário do RemoteAuth em /tmp se ainda existir
-  const tempDir = `/tmp/wwebjs/wwebjs_temp_session_${userId}`
-  if (existsSync(tempDir)) {
-    try { rmSync(tempDir, { recursive: true, force: true }) } catch {}
-  }
-
-  console.log(`[${ts()}] [${userId}] [DELETE] Sessão deletada do banco e da memória`)
+  console.log(`[${ts()}] [${userId}] [DELETE] Sessão deletada`)
   res.json({ message: `Sessão ${userId} deletada.`, userId })
 })
 
 app.all('/webhook/*splat', (_req: Request, res: Response) => {
-  res.status(410).json({ ok: false, error: 'webhook_disabled', message: 'Endpoints de webhook/n8n foram desativados neste projeto.' })
+  res.status(410).json({ ok: false, error: 'webhook_disabled' })
 })
 
 // ─── Fila de envio ────────────────────────────────────────────────────────────
@@ -768,46 +704,52 @@ async function processQueue(userId: string) {
       console.log(`[${ts()}] [${userId}] [SEND] Enviando ${type} para ${number} | fila restante: ${queue.length}`)
 
       try {
-        const numberId = await session.client.getNumberId(number)
-        if (!numberId) {
-          console.warn(`[${ts()}] [${userId}] [SEND_FAIL] Número sem WhatsApp: ${number}`)
-          reject(new Error(`Número ${number} não possui WhatsApp.`))
-          continue
+        const jid = `${number.replace(/\D/g, '')}@s.whatsapp.net`
+
+        let sendPayload: any
+        if (currentItem.media?.ptt) {
+          sendPayload = {
+            audio: Buffer.from(currentItem.media.base64, 'base64'),
+            mimetype: currentItem.media.mimetype,
+            ptt: true,
+          }
+        } else if (currentItem.media) {
+          sendPayload = {
+            image: Buffer.from(currentItem.media.base64, 'base64'),
+            caption: message || undefined,
+            mimetype: currentItem.media.mimetype,
+          }
+        } else {
+          sendPayload = { text: message }
         }
 
-        const chatId = numberId._serialized
-        const sendPayload: string | MessageMedia = currentItem.media
-          ? new MessageMedia(currentItem.media.mimetype, currentItem.media.base64, currentItem.media.filename)
-          : message
-        const sendOptions: Record<string, unknown> = { sendSeen: false }
-        if (currentItem.media?.ptt) sendOptions.sendAudioAsVoice = true
-
-        const sentMessage = await session.client.sendMessage(chatId, sendPayload, sendOptions)
-        session.sentMessages += 1
+        const sentMsg = await session.sock.sendMessage(jid, sendPayload)
+        const whatsappMessageId = sentMsg?.key?.id ?? ''
+        session.sentMessages++
 
         const ms = Date.now() - t0
-        const logType = currentItem.media?.ptt ? 'ptt' : currentItem.media ? 'image' : 'chat'
-        const logBody = currentItem.media?.ptt ? `[voz: ${currentItem.media.filename}]`
-          : currentItem.media ? `[imagem: ${currentItem.media.filename}]` : message
-        console.log(`[${ts()}] [${userId}] [SEND_OK] ${type} entregue para ${number} em ${ms}ms (waId=${sentMessage.id._serialized.slice(-12)}) | total: ${session.sentMessages}`)
+        console.log(`[${ts()}] [${userId}] [SEND_OK] ${type} para ${number} em ${ms}ms (waId=...${whatsappMessageId.slice(-12)}) | total: ${session.sentMessages}`)
 
         cappedMapSet(messageRegistry, messageId, {
           userId, instanceId: session.instanceId, timestamp: new Date(),
-          type: 'sent', whatsappMessageId: sentMessage.id._serialized, to: number,
+          type: 'sent', whatsappMessageId, to: number,
         }, MAX_REGISTRY_SIZE)
+
+        const logBody = type === 'ptt' ? `[voz: ${currentItem.media?.filename}]`
+          : type === 'image' ? `[imagem: ${currentItem.media?.filename}]` : message
 
         session.logs.push({
           messageId, userId, instanceId: session.instanceId, number, name: number,
-          body: logBody, type: logType, direction: 'sent', timestamp: new Date(),
+          body: logBody, type, direction: 'sent', timestamp: new Date(),
           media: currentItem.media ? { mimetype: currentItem.media.mimetype, filename: currentItem.media.filename } : null,
-          whatsappMessageId: sentMessage.id._serialized,
+          whatsappMessageId,
         })
         if (session.logs.length > MAX_SESSION_LOGS) session.logs.shift()
 
         resolve({
           success: true, messageId,
-          message: currentItem.media?.ptt ? 'Áudio enviado!' : currentItem.media ? 'Imagem enviada!' : 'Mensagem enviada!',
-          whatsappMessageId: sentMessage.id._serialized,
+          message: type === 'ptt' ? 'Áudio enviado!' : type === 'image' ? 'Imagem enviada!' : 'Mensagem enviada!',
+          whatsappMessageId,
         })
       } catch (err: any) {
         const ms = Date.now() - t0
@@ -821,26 +763,17 @@ async function processQueue(userId: string) {
   }
 }
 
-// ─── Helpers compartilhados dos endpoints de envio ────────────────────────────
+// ─── Helpers dos endpoints de envio ──────────────────────────────────────────
 
-function checkSendPreconditions(session: SessionData, _userId: string, res: Response): boolean {
+function checkSendPreconditions(session: SessionData, res: Response): boolean {
   if (!session.ready) {
     res.status(400).send('Instância não pronta.')
-    return false
-  }
-  if (isInWarmup(session)) {
-    res.status(503).json({ error: 'instance_not_ready', retryAfter: 5 })
     return false
   }
   return true
 }
 
 function handleSendError(err: any, userId: string, label: string, session: SessionData, res: Response): void {
-  if (isWidFactoryError(err)) {
-    console.warn(`[${ts()}] [${userId}] [SEND_FAIL] WidFactory — retornando 503`)
-    res.status(503).json({ error: 'instance_not_ready', retryAfter: 10 })
-    return
-  }
   console.error(`[${ts()}] [${userId}] [SEND_FAIL] ${label}:`, err.message)
   res.status(500).json({
     error: `Erro ao enviar ${label}.`,
@@ -860,7 +793,7 @@ app.post('/message/send-text/:userId', async (req: Request, res: Response) => {
   if (!number || !message) {
     return res.status(400).json({
       ok: false, error: 'invalid_payload',
-      details: "Campos 'number' e 'message' são obrigatórios no JSON body.",
+      details: "Campos 'number' e 'message' são obrigatórios.",
       example: { number: '5511999999999', message: 'Olá!' },
     })
   }
@@ -869,10 +802,8 @@ app.post('/message/send-text/:userId', async (req: Request, res: Response) => {
   if (!session) return res.status(404).send('Sessão não encontrada.')
   session.apiCalls++
 
-  await syncSessionReadiness(session)
-  if (!checkSendPreconditions(session, userId, res)) return
+  if (!checkSendPreconditions(session, res)) return
 
-  console.log(`[${ts()}] [${userId}] [SEND] /send-text → ${number} | fila: ${messageQueues.get(userId)?.length ?? 0}`)
   if (!messageQueues.has(userId)) messageQueues.set(userId, [])
   const messageId = generateUniqueId()
 
@@ -884,7 +815,7 @@ app.post('/message/send-text/:userId', async (req: Request, res: Response) => {
   try {
     const result = await Promise.race([
       sendPromise,
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Tempo limite excedido. Tente novamente.')), SEND_TIMEOUT_MS)),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Tempo limite excedido.')), SEND_TIMEOUT_MS)),
     ])
     res.json({ ...result, userId, instanceId: session.instanceId })
   } catch (err: any) {
@@ -912,20 +843,17 @@ app.post('/message/send-image/:userId', async (req: Request, res: Response) => {
 
   const number  = String(req.body.number  ?? '').trim()
   const caption = String(req.body.caption ?? '').trim()
-  if (!number) return res.status(400).json({ ok: false, error: 'invalid_payload', details: "Campo 'number' é obrigatório." })
-  if (!req.file) return res.status(400).json({ ok: false, error: 'invalid_payload', details: "Campo 'image' (arquivo) é obrigatório." })
+  if (!number)    return res.status(400).json({ ok: false, error: 'invalid_payload', details: "Campo 'number' é obrigatório." })
+  if (!req.file)  return res.status(400).json({ ok: false, error: 'invalid_payload', details: "Campo 'image' (arquivo) é obrigatório." })
 
   session.apiCalls++
-  await syncSessionReadiness(session)
-  if (!checkSendPreconditions(session, userId, res)) return
+  if (!checkSendPreconditions(session, res)) return
 
-  console.log(`[${ts()}] [${userId}] [SEND] /send-image → ${number} | ${req.file.originalname ?? 'sem nome'} (${(req.file.size / 1024).toFixed(1)} KB) | fila: ${messageQueues.get(userId)?.length ?? 0}`)
   if (!messageQueues.has(userId)) messageQueues.set(userId, [])
-
   const messageId = generateUniqueId()
   const base64 = req.file.buffer.toString('base64')
   const ext = req.file.mimetype.split('/')[1]?.replace('jpeg', 'jpg') ?? 'jpg'
-  const safeName = (req.file.originalname ?? '').trim().replace(/[/\\]/g, '').replace(/\.\./g, '').trim()
+  const safeName = (req.file.originalname ?? '').trim().replace(/[/\\]/g, '').replace(/\.\./g, '')
   const filename = safeName || `image-${Date.now()}.${ext}`
 
   const sendPromise = new Promise<SendResult>((resolve, reject) => {
@@ -936,7 +864,7 @@ app.post('/message/send-image/:userId', async (req: Request, res: Response) => {
   try {
     const result = await Promise.race([
       sendPromise,
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Tempo limite excedido. Tente novamente.')), SEND_TIMEOUT_MS)),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Tempo limite excedido.')), SEND_TIMEOUT_MS)),
     ])
     res.json({ ...result, userId, instanceId: session.instanceId })
   } catch (err: any) {
@@ -963,20 +891,17 @@ app.post('/message/send-audio/:userId', async (req: Request, res: Response) => {
   }
 
   const number = String(req.body.number ?? '').trim()
-  if (!number) return res.status(400).json({ ok: false, error: 'invalid_payload', details: "Campo 'number' é obrigatório." })
+  if (!number)   return res.status(400).json({ ok: false, error: 'invalid_payload', details: "Campo 'number' é obrigatório." })
   if (!req.file) return res.status(400).json({ ok: false, error: 'invalid_payload', details: "Campo 'audio' (arquivo) é obrigatório." })
 
   session.apiCalls++
-  await syncSessionReadiness(session)
-  if (!checkSendPreconditions(session, userId, res)) return
+  if (!checkSendPreconditions(session, res)) return
 
-  console.log(`[${ts()}] [${userId}] [SEND] /send-audio → ${number} | ${req.file.originalname ?? 'sem nome'} (${(req.file.size / 1024).toFixed(1)} KB) | fila: ${messageQueues.get(userId)?.length ?? 0}`)
   if (!messageQueues.has(userId)) messageQueues.set(userId, [])
-
   const messageId = generateUniqueId()
   const base64 = req.file.buffer.toString('base64')
   const ext = (req.file.mimetype.split('/')[1]?.split(';')[0] ?? 'ogg').replace('mpeg', 'mp3')
-  const safeName = (req.file.originalname ?? '').trim().replace(/[/\\]/g, '').replace(/\.\./g, '').trim()
+  const safeName = (req.file.originalname ?? '').trim().replace(/[/\\]/g, '').replace(/\.\./g, '')
   const filename = safeName || `audio-${Date.now()}.${ext}`
 
   const sendPromise = new Promise<SendResult>((resolve, reject) => {
@@ -987,7 +912,7 @@ app.post('/message/send-audio/:userId', async (req: Request, res: Response) => {
   try {
     const result = await Promise.race([
       sendPromise,
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Tempo limite excedido. Tente novamente.')), SEND_TIMEOUT_MS)),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Tempo limite excedido.')), SEND_TIMEOUT_MS)),
     ])
     res.json({ ...result, userId, instanceId: session.instanceId })
   } catch (err: any) {
@@ -1007,7 +932,7 @@ app.post('/ia/pause/:userId', (req: Request, res: Response) => {
   if (!pausedNumbers.has(userId)) pausedNumbers.set(userId, new Set())
   pausedNumbers.get(userId)!.add(number)
   console.log(`[${ts()}] [${userId}] [IA] Pausada para ${number}`)
-  res.json({ message: `Atendimento da IA pausado para ${number} em ${userId}`, userId, instanceId: session.instanceId, number, actionId: generateUniqueId() })
+  res.json({ message: `IA pausada para ${number}`, userId, instanceId: session.instanceId, number, actionId: generateUniqueId() })
 })
 
 app.post('/ia/resume/:userId', (req: Request, res: Response) => {
@@ -1019,31 +944,13 @@ app.post('/ia/resume/:userId', (req: Request, res: Response) => {
   session.apiCalls++
   pausedNumbers.get(userId)?.delete(number)
   console.log(`[${ts()}] [${userId}] [IA] Retomada para ${number}`)
-  res.json({ message: `Atendimento da IA retomado para ${number} em ${userId}`, userId, instanceId: session.instanceId, number, actionId: generateUniqueId() })
+  res.json({ message: `IA retomada para ${number}`, userId, instanceId: session.instanceId, number, actionId: generateUniqueId() })
 })
 
 // ─── Mídia / mensagem por ID ──────────────────────────────────────────────────
 
-app.get('/message/media/:userId/:whatsappMessageId', async (req: Request, res: Response) => {
-  const userId = getParam(req.params.userId)
-  const whatsappMessageId = getParam(req.params.whatsappMessageId)
-  const session = activeClients.get(userId)
-  if (!session) return res.status(404).send('Sessão não encontrada.')
-  session.apiCalls++
-  await syncSessionReadiness(session)
-  if (!session.ready) return res.status(400).send('Instância não pronta.')
-  try {
-    const message = await session.client.getMessageById(whatsappMessageId)
-    if (!message.hasMedia) return res.status(400).send('Esta mensagem não contém mídia.')
-    const media = await message.downloadMedia()
-    if (!media) return res.status(404).send('Falha ao baixar mídia da mensagem.')
-    const mediaId = generateUniqueId()
-    const messageData = message as unknown as { _data?: { filename?: string } }
-    res.json({ mediaId, whatsappMessageId, userId, instanceId: session.instanceId, mimetype: media.mimetype, data: media.data, filename: messageData._data?.filename || null })
-  } catch (err: any) {
-    console.error(`[${ts()}] [${userId}] Erro ao obter mídia:`, err)
-    res.status(500).send(`Erro ao obter mídia: ${err?.message}`)
-  }
+app.get('/message/media/:userId/:whatsappMessageId', (_req: Request, res: Response) => {
+  res.status(501).json({ ok: false, error: 'not_implemented', message: 'Download de mídia por ID não disponível com Baileys.' })
 })
 
 app.get('/message/:messageId', (req: Request, res: Response) => {
@@ -1064,7 +971,7 @@ app.get('/messages/sent/:userId', (req: Request, res: Response) => {
 app.get('/messages/registry', (req: Request, res: Response) => {
   const limitParsed  = parseInt(getParam(req.query.limit  as string | undefined), 10)
   const offsetParsed = parseInt(getParam(req.query.offset as string | undefined), 10)
-  const limit  = Math.min(isNaN(limitParsed)  ? 100 : Math.max(1, limitParsed),  500)
+  const limit  = Math.min(isNaN(limitParsed)  ? 100 : Math.max(1, limitParsed), 500)
   const offset = isNaN(offsetParsed) ? 0 : Math.max(0, offsetParsed)
   const all  = Array.from(messageRegistry.entries()).map(([messageId, data]) => ({ messageId, data }))
   const page = all.slice(offset, offset + limit)
@@ -1081,7 +988,7 @@ app.get('/instance/insights', (_req: Request, res: Response) => {
       ready: session.ready, number: session.number || null,
       totalApiCalls: session.apiCalls, sentMessages: session.sentMessages,
       receivedMessages: session.receivedMessages, authenticated: session.authenticated,
-      state: session.lastKnownState, queueLength: messageQueues.get(userId)?.length || 0,
+      state: deriveState(session), queueLength: messageQueues.get(userId)?.length || 0,
       cachedLogs: session.logs.length,
     })
   }
@@ -1098,7 +1005,7 @@ app.get('/instance/insights/:userId', (req: Request, res: Response) => {
     ready: session.ready, number: session.number || null,
     totalApiCalls: session.apiCalls, sentMessages: session.sentMessages,
     receivedMessages: session.receivedMessages, authenticated: session.authenticated,
-    state: session.lastKnownState, queueLength: messageQueues.get(userId)?.length || 0,
+    state: deriveState(session), queueLength: messageQueues.get(userId)?.length || 0,
     cachedLogs: session.logs.length,
   })
 })
@@ -1106,25 +1013,25 @@ app.get('/instance/insights/:userId', (req: Request, res: Response) => {
 // ─── Health check ─────────────────────────────────────────────────────────────
 
 app.get('/', (_req: Request, res: Response) => {
-  res.json({ message: 'API WhatsApp ativa 🚀', version: '2.0.0', features: ['Unique IDs', 'Message Registry', 'Instance Tracking', 'Webhook Disabled'] })
+  res.json({ message: 'API WhatsApp (Baileys) ativa 🚀', version: '3.0.0' })
 })
 
 // ─── Processo ─────────────────────────────────────────────────────────────────
 
 process.on('uncaughtException', (err: Error) => {
-  console.error(`[${ts()}] [PROCESSO] Exceção não capturada — servidor mantido vivo:`, err.message)
+  console.error(`[${ts()}] [PROCESSO] Exceção não capturada:`, err.message)
 })
 
 process.on('unhandledRejection', (reason: unknown) => {
   const msg = reason instanceof Error ? reason.message : String(reason)
-  console.error(`[${ts()}] [PROCESSO] Rejeição não tratada — servidor mantido vivo:`, msg)
+  console.error(`[${ts()}] [PROCESSO] Rejeição não tratada:`, msg)
 })
 
 async function gracefulShutdown(signal: string) {
-  console.log(`[${ts()}] [SHUTDOWN] Sinal ${signal} recebido. Encerrando ${activeClients.size} sessão(ões)...`)
+  console.log(`[${ts()}] [SHUTDOWN] Sinal ${signal} — encerrando ${activeClients.size} sessão(ões)...`)
   for (const [userId, session] of activeClients.entries()) {
     session.destroyingIntentionally = true
-    try { await session.client.destroy(); console.log(`[${ts()}] [SHUTDOWN] Sessão ${userId} encerrada`) } catch {}
+    try { session.sock.end(undefined); console.log(`[${ts()}] [SHUTDOWN] ${userId} encerrado`) } catch {}
   }
   process.exit(0)
 }
@@ -1132,27 +1039,21 @@ async function gracefulShutdown(signal: string) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
 process.on('SIGINT',  () => gracefulShutdown('SIGINT'))
 
+// ─── Startup ──────────────────────────────────────────────────────────────────
+
 const PORT = process.env.PORT || 8080
 
 async function start() {
   await initDatabase()
 
   app.listen(PORT, async () => {
-    console.log(`[${ts()}] [STARTUP] Backend WhatsApp rodando na porta ${PORT}`)
+    console.log(`[${ts()}] [STARTUP] Backend WhatsApp (Baileys) rodando na porta ${PORT}`)
     console.log(`[${ts()}] [STARTUP] Hostname:        ${hostname()}`)
     console.log(`[${ts()}] [STARTUP] API_KEY:         ${API_KEY ? 'configurada ✓' : 'NÃO CONFIGURADA ⚠'}`)
     console.log(`[${ts()}] [STARTUP] WEBHOOK_URL:     ${process.env.WEBHOOK_URL || 'não configurada'}`)
     console.log(`[${ts()}] [STARTUP] WEBHOOK_SECRET:  ${process.env.WEBHOOK_SECRET ? 'configurado ✓' : 'não configurado'}`)
     console.log(`[${ts()}] [STARTUP] SENDERWHATS_URL: ${process.env.SENDERWHATS_URL || 'não configurada'}`)
     console.log(`[${ts()}] [STARTUP] DATABASE_URL:    ${process.env.DATABASE_URL ? 'configurada ✓' : 'NÃO CONFIGURADA ⚠'}`)
-
-    const chromiumPath = '/usr/bin/chromium'
-    if (existsSync(chromiumPath)) {
-      const ver = spawnSync(chromiumPath, ['--version'], { encoding: 'utf8' })
-      console.log(`[${ts()}] [STARTUP] Chromium:        ${ver.stdout?.trim() || 'encontrado (versão indisponível)'}`)
-    } else {
-      console.error(`[${ts()}] [STARTUP] Chromium:        NÃO ENCONTRADO em ${chromiumPath} — instâncias falharão ao iniciar`)
-    }
 
     const toRecover = await loadPersistedSessions()
     if (toRecover.length === 0) {
@@ -1163,7 +1064,7 @@ async function start() {
         setTimeout(() => {
           console.log(`[${ts()}] [STARTUP] Iniciando recuperação de: ${uid}`)
           createSession(uid)
-        }, index * 5_000)
+        }, index * 3_000)
       })
     }
   })

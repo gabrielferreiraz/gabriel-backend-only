@@ -1,44 +1,37 @@
 {
   "name": "backend",
-  "version": "2.0.0",
-  "description": "API WhatsApp com IDs únicos para integração com n8n",
+  "version": "3.0.0",
+  "description": "API WhatsApp com Baileys — multi-sessão leve para SenderWhats",
   "main": "index.ts",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "ts-node index.ts",
-    "dev": "nodemon --exec ts-node index.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "start": "node --max-old-space-size=128 dist/index.js",
+    "dev": "node --loader ts-node/esm --max-old-space-size=512 index.ts"
   },
   "dependencies": {
-    "@types/multer": "^2.1.0",
-    "@types/pg": "^8.20.0",
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.18",
     "axios": "^1.9.0",
     "body-parser": "^2.2.0",
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "multer": "^2.1.1",
     "pg": "^8.22.0",
-    "qrcode": "^1.5.4",
-    "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.34.6"
+    "pino": "^8.21.0",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
+    "@types/multer": "^2.1.0",
     "@types/node": "^25.6.0",
+    "@types/pg": "^8.20.0",
     "@types/qrcode": "^1.5.6",
-    "nodemon": "^3.0.0",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3"
   },
-  "keywords": [
-    "whatsapp",
-    "api",
-    "n8n",
-    "webhook",
-    "unique-ids"
-  ],
+  "keywords": ["whatsapp", "api", "baileys", "webhook"],
   "author": "",
-  "license": "ISC",
-  "type": "commonjs"
+  "license": "ISC"
 }
