@@ -278,6 +278,12 @@ function createSession(userId: string): string {
   ;(async () => {
     const { state, saveCreds } = await usePostgreSQLAuthState(userId)
 
+    // Guarda contra race condition: outra chamada pode ter criado a sessão durante o await acima
+    if (activeClients.has(userId)) {
+      console.log(`[${ts()}] [${userId}] Sessão já existe após consulta ao banco — abortando duplicata`)
+      return
+    }
+
     const sock = makeWASocket({
       auth: state,
       logger: pino({ level: 'silent' }),
@@ -427,9 +433,17 @@ function createSession(userId: string): string {
           const jid = msg.key.remoteJid ?? ''
           if (jid.endsWith('@g.us') || jid.endsWith('@newsletter') || jid.endsWith('@broadcast')) continue
 
-          const msgContent = msg.message ?? {}
-          const msgType = Object.keys(msgContent)[0] ?? 'unknown'
-          const IGNORED_TYPES = ['protocolMessage', 'senderKeyDistributionMessage', 'reactionMessage', 'pollUpdateMessage', 'ephemeralMessage']
+          if (!msg.message) continue
+
+          // Desempacota viewOnce antes de checar o tipo real
+          let msgContent: Record<string, any> = msg.message as any
+          if (msgContent.viewOnceMessage?.message) msgContent = msgContent.viewOnceMessage.message
+          if (msgContent.viewOnceMessageV2?.message?.message) msgContent = msgContent.viewOnceMessageV2.message.message
+
+          const msgType = Object.keys(msgContent)[0]
+          if (!msgType) continue
+
+          const IGNORED_TYPES = ['protocolMessage', 'senderKeyDistributionMessage', 'reactionMessage', 'pollUpdateMessage', 'ephemeralMessage', 'keepInChatMessage']
           if (IGNORED_TYPES.includes(msgType)) continue
 
           sessionData.receivedMessages++
