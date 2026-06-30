@@ -8,6 +8,7 @@ import { Pool } from "pg"
 import makeWASocket, {
   DisconnectReason,
   Browsers,
+  fetchLatestBaileysVersion,
   initAuthCreds,
   BufferJSON,
   type AuthenticationCreds,
@@ -302,8 +303,11 @@ function createSession(userId: string): string {
       return
     }
 
+    const { version } = await fetchLatestBaileysVersion()
+
     const sock = makeWASocket({
       auth: state,
+      version,
       logger: noopLogger,
       printQRInTerminal: false,
       browser: Browsers.ubuntu('Chrome'),
