@@ -378,7 +378,8 @@ function createSession(userId: string): string {
         const needsNewQR = (
           statusCode === DisconnectReason.loggedOut ||   // 401 — logout manual ou banimento
           statusCode === DisconnectReason.badSession ||  // 500 — credenciais corrompidas
-          statusCode === 403                             // 403 — forbidden (ban potencial)
+          statusCode === 403 ||                          // 403 — forbidden (ban potencial)
+          statusCode === 405                             // 405 — WhatsApp rejeitou o registro do dispositivo
         )
 
         if (needsNewQR) {
