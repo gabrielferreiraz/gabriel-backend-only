@@ -7,6 +7,7 @@ import { hostname } from "os"
 import { Pool } from "pg"
 import makeWASocket, {
   DisconnectReason,
+  Browsers,
   initAuthCreds,
   BufferJSON,
   type AuthenticationCreds,
@@ -218,6 +219,7 @@ const pausedNumbers    = new Map<string, Set<string>>()
 const messageQueues    = new Map<string, QueueItem[]>()
 const isSendingMessage = new Map<string, boolean>()
 const messageRegistry  = new Map<string, RegistryPayload>()
+const sessionRetryCount = new Map<string, number>()  // persiste contagem entre reconexões do mesmo userId
 
 const MAX_REGISTRY_SIZE       = 5000
 const MAX_SESSION_LOGS        = 200
@@ -262,21 +264,31 @@ function getParam(value: string | string[] | undefined): string {
 function computeSessionStatus(session: SessionData): 'ready' | 'qr_pending' | 'initializing' | 'disconnected' {
   if (session.ready) return 'ready'
   if (session.qrCode) return 'qr_pending'
-  if (session.destroyingIntentionally) return 'disconnected'
+  if (session.destroyingIntentionally || session.lastError) return 'disconnected'
   return 'initializing'
 }
 
 function deriveState(session: SessionData): string {
   if (session.ready) return 'CONNECTED'
   if (session.qrCode) return 'QR_PENDING'
-  if (session.destroyingIntentionally) return 'DISCONNECTED'
+  if (session.destroyingIntentionally || session.lastError) return 'DISCONNECTED'
   return 'INITIALIZING'
 }
 
 // ─── Criação de sessão (Baileys) ──────────────────────────────────────────────
 
 function createSession(userId: string): string {
-  if (activeClients.has(userId)) return activeClients.get(userId)!.instanceId
+  const existing = activeClients.get(userId)
+  if (existing) {
+    // Sessão morta (lastError + sem socket ativo): limpa e recria
+    if (existing.lastError && !existing.ready && !existing.authenticated) {
+      existing.destroyingIntentionally = true
+      try { existing.sock.end(undefined) } catch {}
+      activeClients.delete(userId)
+    } else {
+      return existing.instanceId
+    }
+  }
 
   const instanceId = generateUniqueId()
   console.log(`[${ts()}] [${userId}] Criando sessão Baileys (instanceId: ${instanceId})...`)
@@ -294,7 +306,7 @@ function createSession(userId: string): string {
       auth: state,
       logger: noopLogger,
       printQRInTerminal: false,
-      browser: ['SenderWhats', 'Chrome', '120.0.6099.71'] as [string, string, string],
+      browser: Browsers.ubuntu('Chrome'),
       connectTimeoutMs: 60_000,
       defaultQueryTimeoutMs: 60_000,
       keepAliveIntervalMs: 30_000,
@@ -351,6 +363,7 @@ function createSession(userId: string): string {
         sessionData.readyAt = new Date()
         sessionData.retryCount = 0
         sessionData.number = number
+        sessionRetryCount.delete(userId)
         console.log(`[${ts()}] [${userId}] [READY] Conexão aberta — número: ${number} | uptime: ${uptime}s`)
         processQueue(userId)
       }
@@ -388,11 +401,13 @@ function createSession(userId: string): string {
         if (needsNewQR) {
           const reason =
             statusCode === 403 ? 'Conta possivelmente banida (403)' :
+            statusCode === 405 ? 'Conexão rejeitada pelo WhatsApp — aguarde e tente reconectar' :
             statusCode === DisconnectReason.badSession ? 'Sessão corrompida — novo QR necessário' :
             'Desconectado (logout) — novo QR necessário'
 
           console.warn(`[${ts()}] [${userId}] [DISCONNECT] ${reason} — credenciais removidas`)
           sessionData.lastError = reason
+          sessionRetryCount.delete(userId)
 
           await pool.query(
             'DELETE FROM baileys_sessions WHERE session_id = $1',
@@ -404,10 +419,11 @@ function createSession(userId: string): string {
         }
 
         // ── Casos que reconectam automaticamente com backoff exponencial ──
-        sessionData.retryCount++
+        const retryCount = (sessionRetryCount.get(userId) ?? 0) + 1
+        sessionRetryCount.set(userId, retryCount)
 
         // Delay: 5s → 10s → 20s → 40s → 80s → máx 300s (5 min)
-        const backoffMs = Math.min(5_000 * Math.pow(2, sessionData.retryCount - 1), 300_000)
+        const backoffMs = Math.min(5_000 * Math.pow(2, retryCount - 1), 300_000)
 
         // connectionReplaced (440): outra aba/app abriu o WA — espera mais para não conflitar
         const label = statusCode === DisconnectReason.connectionReplaced
@@ -416,7 +432,7 @@ function createSession(userId: string): string {
             ? 'reinício solicitado pelo WA'
             : `código ${statusCode ?? '?'}`
 
-        console.log(`[${ts()}] [${userId}] [RECONNECT] ${label} — tentativa ${sessionData.retryCount}, aguardando ${backoffMs / 1000}s`)
+        console.log(`[${ts()}] [${userId}] [RECONNECT] ${label} — tentativa ${retryCount}, aguardando ${backoffMs / 1000}s`)
 
         setTimeout(() => {
           if (activeClients.has(userId) && !sessionData.destroyingIntentionally) {
