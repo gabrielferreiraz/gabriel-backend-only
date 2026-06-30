@@ -303,6 +303,8 @@ function createSession(userId: string): string {
       markOnlineOnConnect: false,
     })
 
+    let qrActive = true  // false quando socket fecha — impede callback async de sobrescrever qrCode
+
     const sessionData: SessionData = {
       sock,
       qrCode: null,
@@ -331,7 +333,7 @@ function createSession(userId: string): string {
 
       if (qr) {
         qrcode.toDataURL(qr, (err: Error | null | undefined, url: string) => {
-          if (!err) {
+          if (!err && qrActive) {
             sessionData.qrCode = url
             console.log(`[${ts()}] [${userId}] [QR] Novo QR code gerado — aguardando scan`)
           }
@@ -354,6 +356,7 @@ function createSession(userId: string): string {
       }
 
       if (connection === 'close') {
+        qrActive = false
         sessionData.ready = false
         sessionData.authenticated = false
         sessionData.qrCode = null
