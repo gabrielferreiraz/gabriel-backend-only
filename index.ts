@@ -13,7 +13,13 @@ import makeWASocket, {
   type SignalDataTypeMap,
 } from "@whiskeysockets/baileys"
 import { Boom } from "@hapi/boom"
-import pino from "pino"
+// Logger silencioso compatível com a interface que Baileys espera
+const noopLogger = {
+  level: 'silent',
+  trace: () => {}, debug: () => {}, info: () => {},
+  warn:  () => {}, error: () => {}, fatal: () => {},
+  child: (): any => noopLogger,
+} as any
 
 // ─── PostgreSQL ───────────────────────────────────────────────────────────────
 
@@ -64,7 +70,7 @@ async function usePostgreSQLAuthState(userId: string): Promise<{
   const keys = {
     get: async <T extends keyof SignalDataTypeMap>(type: T, ids: string[]) => {
       const result: { [id: string]: SignalDataTypeMap[T] } = {}
-      const store = keysData[type] ?? {}
+      const store = keysData[type as string] ?? {}
       for (const id of ids) {
         if (store[id] !== undefined) result[id] = store[id]
       }
@@ -286,7 +292,7 @@ function createSession(userId: string): string {
 
     const sock = makeWASocket({
       auth: state,
-      logger: pino({ level: 'silent' }),
+      logger: noopLogger,
       printQRInTerminal: false,
       browser: ['SenderWhats', 'Chrome', '120.0.6099.71'] as [string, string, string],
       connectTimeoutMs: 60_000,
@@ -360,29 +366,60 @@ function createSession(userId: string): string {
           console.warn(`[${ts()}] [${userId}] [DISCONNECT] Fila drenada: ${pending.length} item(ns)`)
         }
 
+        if (sessionData.destroyingIntentionally) {
+          console.log(`[${ts()}] [${userId}] [DISCONNECT] Encerrado intencionalmente`)
+          return
+        }
+
         const err = lastDisconnect?.error as Boom | undefined
         const statusCode = err?.output?.statusCode
-        const isLoggedOut = statusCode === DisconnectReason.loggedOut
 
-        if (isLoggedOut) {
-          console.warn(`[${ts()}] [${userId}] [DISCONNECT] Logout detectado — credenciais removidas`)
-          sessionData.lastError = 'Desconectado (logout). Escaneie o QR novamente.'
+        // ── Casos que exigem novo QR (não reconectar automaticamente) ──
+        const needsNewQR = (
+          statusCode === DisconnectReason.loggedOut ||   // 401 — logout manual ou banimento
+          statusCode === DisconnectReason.badSession ||  // 500 — credenciais corrompidas
+          statusCode === 403                             // 403 — forbidden (ban potencial)
+        )
+
+        if (needsNewQR) {
+          const reason =
+            statusCode === 403 ? 'Conta possivelmente banida (403)' :
+            statusCode === DisconnectReason.badSession ? 'Sessão corrompida — novo QR necessário' :
+            'Desconectado (logout) — novo QR necessário'
+
+          console.warn(`[${ts()}] [${userId}] [DISCONNECT] ${reason} — credenciais removidas`)
+          sessionData.lastError = reason
+
           await pool.query(
             'DELETE FROM baileys_sessions WHERE session_id = $1',
             [`baileys-${userId}`]
           ).catch(() => {})
-        } else if (!sessionData.destroyingIntentionally) {
-          sessionData.retryCount++
-          console.log(`[${ts()}] [${userId}] [RECONNECT] Reconectando em 5s... (código: ${statusCode ?? '?'}, tentativa ${sessionData.retryCount})`)
-          setTimeout(() => {
-            if (activeClients.has(userId) && !sessionData.destroyingIntentionally) {
-              activeClients.delete(userId)
-              createSession(userId)
-            }
-          }, 5_000)
-        } else {
-          console.log(`[${ts()}] [${userId}] [DISCONNECT] Encerrado intencionalmente`)
+
+          // Mantém na memória com status 'disconnected' para a interface mostrar o erro
+          return
         }
+
+        // ── Casos que reconectam automaticamente com backoff exponencial ──
+        sessionData.retryCount++
+
+        // Delay: 5s → 10s → 20s → 40s → 80s → máx 300s (5 min)
+        const backoffMs = Math.min(5_000 * Math.pow(2, sessionData.retryCount - 1), 300_000)
+
+        // connectionReplaced (440): outra aba/app abriu o WA — espera mais para não conflitar
+        const label = statusCode === DisconnectReason.connectionReplaced
+          ? 'substituída por outro cliente'
+          : statusCode === DisconnectReason.restartRequired
+            ? 'reinício solicitado pelo WA'
+            : `código ${statusCode ?? '?'}`
+
+        console.log(`[${ts()}] [${userId}] [RECONNECT] ${label} — tentativa ${sessionData.retryCount}, aguardando ${backoffMs / 1000}s`)
+
+        setTimeout(() => {
+          if (activeClients.has(userId) && !sessionData.destroyingIntentionally) {
+            activeClients.delete(userId)
+            createSession(userId)
+          }
+        }, backoffMs)
       }
     })
 
