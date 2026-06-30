@@ -422,8 +422,11 @@ function createSession(userId: string): string {
         const retryCount = (sessionRetryCount.get(userId) ?? 0) + 1
         sessionRetryCount.set(userId, retryCount)
 
-        // Delay: 5s → 10s → 20s → 40s → 80s → máx 300s (5 min)
-        const backoffMs = Math.min(5_000 * Math.pow(2, retryCount - 1), 300_000)
+        // restartRequired: WhatsApp pediu reconexão imediata → 1s fixo sem backoff
+        // Demais casos: 5s → 10s → 20s → 40s → 80s → máx 300s (5 min)
+        const backoffMs = statusCode === DisconnectReason.restartRequired
+          ? 1_000
+          : Math.min(5_000 * Math.pow(2, retryCount - 1), 300_000)
 
         // connectionReplaced (440): outra aba/app abriu o WA — espera mais para não conflitar
         const label = statusCode === DisconnectReason.connectionReplaced
