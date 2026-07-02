@@ -467,7 +467,7 @@ function createSession(userId: string): string {
         console.log(`[${ts()}] [${userId}] [RECONNECT] ${label} — tentativa ${retryCount}, aguardando ${backoffMs / 1000}s`)
 
         setTimeout(() => {
-          if (activeClients.has(userId) && !sessionData.destroyingIntentionally) {
+          if (activeClients.has(userId) && !sessionData.destroyingIntentionally && !sessionData.ready) {
             activeClients.delete(userId)
             createSession(userId)
           }
