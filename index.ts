@@ -25,7 +25,13 @@ const noopLogger = {
 
 // ─── PostgreSQL ───────────────────────────────────────────────────────────────
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL })
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,
+  connectionTimeoutMillis: 8_000,   // desiste após 8s esperando conexão do pool
+  idleTimeoutMillis: 30_000,         // libera conexões ociosas após 30s
+  statement_timeout: 10_000,         // mata queries travadas após 10s
+})
 
 async function initDatabase(): Promise<void> {
   await pool.query('SELECT 1 FROM baileys_sessions LIMIT 1')
@@ -104,6 +110,25 @@ async function loadPersistedSessions(): Promise<string[]> {
     console.error(`[${ts()}] [DB] Erro ao carregar sessões:`, e?.message)
     return []
   }
+}
+
+// Versão do protocolo WhatsApp — buscada uma vez no startup, reutilizada em todas as sessões
+let cachedWAVersion: [number, number, number] | undefined
+
+async function getWAVersion(): Promise<[number, number, number]> {
+  if (cachedWAVersion) return cachedWAVersion
+  try {
+    const { version } = await Promise.race([
+      fetchLatestBaileysVersion(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 8_000)),
+    ])
+    cachedWAVersion = version
+    console.log(`[${ts()}] [STARTUP] WhatsApp versão: ${version.join('.')}`)
+  } catch {
+    cachedWAVersion = [2, 3000, 1023571504]  // fallback seguro
+    console.warn(`[${ts()}] [STARTUP] fetchLatestBaileysVersion falhou — usando versão fallback`)
+  }
+  return cachedWAVersion
 }
 
 // ─── Express ──────────────────────────────────────────────────────────────────
@@ -303,7 +328,7 @@ function createSession(userId: string): string {
       return
     }
 
-    const { version } = await fetchLatestBaileysVersion()
+    const version = await getWAVersion()
 
     const sock = makeWASocket({
       auth: state,
@@ -606,23 +631,13 @@ function createSession(userId: string): string {
 
 app.get('/instance/create/:userId', (req: Request, res: Response) => {
   const userId = getParam(req.params.userId)
-
-  if (activeClients.has(userId)) {
-    const existing = activeClients.get(userId)!
-    return res.status(200).json({
-      message: 'Sessão já existe',
-      status: 'existing',
-      userId,
-      instanceId: existing.instanceId,
-      ready: existing.ready,
-      authenticated: existing.authenticated,
-      state: deriveState(existing),
-    })
-  }
-
+  const before = activeClients.get(userId)
+  const wasDeadSession = before && !!before.lastError && !before.ready
   const instanceId = createSession(userId)
   res.status(200).json({
-    message: `Instância '${userId}' criada com sucesso.`,
+    message: wasDeadSession
+      ? `Sessão '${userId}' reiniciada após erro`
+      : `Instância '${userId}' criada ou já existente`,
     userId,
     instanceId,
   })
@@ -728,6 +743,7 @@ app.post('/instance/disconnect/:userId', async (req: Request, res: Response) => 
   pausedNumbers.delete(userId)
   messageQueues.delete(userId)
   isSendingMessage.delete(userId)
+  sessionRetryCount.delete(userId)
 
   console.log(`[${ts()}] [${userId}] [DISCONNECT] Sessão removida — enviadas: ${session.sentMessages} | recebidas: ${session.receivedMessages}`)
   res.json({ message: `Sessão ${userId} desconectada.`, userId, instanceId: session.instanceId })
@@ -744,6 +760,7 @@ app.delete('/instance/:userId', async (req: Request, res: Response) => {
     pausedNumbers.delete(userId)
     messageQueues.delete(userId)
     isSendingMessage.delete(userId)
+    sessionRetryCount.delete(userId)
   }
 
   try {
@@ -1111,6 +1128,7 @@ async function gracefulShutdown(signal: string) {
     session.destroyingIntentionally = true
     try { session.sock.end(undefined); console.log(`[${ts()}] [SHUTDOWN] ${userId} encerrado`) } catch {}
   }
+  try { await pool.end() } catch {}
   process.exit(0)
 }
 
@@ -1123,6 +1141,7 @@ const PORT = process.env.PORT || 8080
 
 async function start() {
   await initDatabase()
+  await getWAVersion()
 
   app.listen(PORT, async () => {
     console.log(`[${ts()}] [STARTUP] Backend WhatsApp (Baileys) rodando na porta ${PORT}`)
